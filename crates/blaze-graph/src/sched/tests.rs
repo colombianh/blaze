@@ -1227,6 +1227,36 @@ fn a_background_job_runs_after_every_other_queued_with_it() {
     }
 }
 
+/// A blocked job waits for upkeep that is queued behind critical work: the upkeep rises to
+/// [`Spawn::BLOCKED`] and runs ahead of that critical job.
+#[test]
+fn a_blocked_waiter_raises_upkeep_ahead_of_critical_work() {
+    let mut sched = Sched::new(Cores::flat(1).unwrap(), 8);
+    sched.spawn(JobId(0), Spawn::root().blocked());
+    assert_eq!(decisions(&mut sched), [wake(0, 0)]);
+    sched.core_idle(CoreId(0));
+    assert_eq!(decisions(&mut sched), [run(0, 0)]);
+    sched.spawn(JobId(1), Spawn::child(JobId(0)).background());
+    sched.spawn(JobId(2), Spawn::child(JobId(0)).critical(true));
+    assert_eq!(sched.band(JobId(1)), Spawn::UPKEEP);
+    assert_eq!(sched.suspended(JobId(0), Wait::Job(JobId(1))), Ok(Suspend::Waiting));
+    assert_eq!(sched.band(JobId(1)), Spawn::BLOCKED, "the upkeep rose to the blocked waiter");
+    assert_eq!(decisions(&mut sched), [run(0, 1)]);
+    sched.audit();
+}
+
+/// Promotion is taken before upkeep when a core has nothing else queued.
+#[test]
+fn promotion_runs_before_upkeep() {
+    let mut sched = Sched::new(Cores::flat(1).unwrap(), 8);
+    all_busy(&mut sched);
+    sched.spawn(JobId(1), Spawn::child(JobId(0)).background());
+    sched.spawn(JobId(2), Spawn::child(JobId(0)).promote());
+    sched.done(JobId(0));
+    assert_eq!(decisions(&mut sched), [run(0, 2)]);
+    sched.audit();
+}
+
 /// Job 0 waits for its background child, queued behind two normal ones: the wait raises it, and
 /// it runs next.
 #[test]
@@ -1335,7 +1365,11 @@ fn a_pool_stop_wakes_no_job_that_is_stopping_a_pool_itself() {
     let woke = world.stop_own(outer, StopReason::Dropper { dropper, panicking: false });
     let mut tokens = Vec::new();
     world.take_woken(outer, &mut tokens);
-    assert_eq!((woke, tokens.as_slice()), (0, &[][..]), "the outer stop woke a job that is not parked");
+    assert_eq!(
+        (woke, tokens.as_slice()),
+        (0, &[][..]),
+        "the outer stop woke a job that is not parked"
+    );
 
     // The inner stop breaks it: its parked job, whose wait leads to the stopping job, fails.
     let woke = world.stop_own(inner, StopReason::Dropper { dropper: stopping, panicking: false });
