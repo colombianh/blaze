@@ -590,6 +590,7 @@ pub fn scheduling(model: &Model, path: &Path, top: usize, out: &mut String) {
         (1, super::sim::Policy::Fifo),
         (workers.div_ceil(2), super::sim::Policy::Fifo),
         (workers, super::sim::Policy::Lifo),
+        (workers, super::sim::Policy::Slack),
         (workers.saturating_mul(2), super::sim::Policy::Fifo),
     ] {
         let it = transcript.replay(cores, policy, calibration.overhead_ns);

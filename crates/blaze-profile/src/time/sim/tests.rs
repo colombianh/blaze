@@ -107,3 +107,82 @@ fn a_wait_on_a_jobs_end_ends_at_that_jobs_last_run() {
     assert_eq!(transcript.replay(1, Policy::Fifo, 0).wall_ns, 13);
     assert_eq!(transcript.replay(2, Policy::Fifo, 0).wall_ns, 11);
 }
+
+fn piece(release: Release, ns: i64, triggers: Vec<Trigger>) -> Job {
+    Job { lane: 0, release, segments: vec![Segment::Run { ns }], waits: 0, triggers }
+}
+
+/// S gives B, D and A to the pool at once, and A then gives C. B is released first, so fifo
+/// fills the free core with B and then D, and A waits. A is on the critical path (slack 0) and
+/// B and D can wait, so slack runs A before them and the build ends sooner.
+#[test]
+fn slack_runs_the_critical_job_before_work_that_can_wait() {
+    let start = Trigger { progress_ns: 0, sets: Sets::Start, job: 0 };
+    let transcript = Transcript {
+        jobs: vec![
+            piece(
+                Release::At { ns: 0 },
+                1,
+                vec![
+                    Trigger { job: 1, ..start },
+                    Trigger { job: 2, ..start },
+                    Trigger { job: 3, ..start },
+                ],
+            ),
+            piece(Release::Spawned, 10, vec![]),
+            piece(Release::Spawned, 10, vec![]),
+            piece(
+                Release::Spawned,
+                10,
+                vec![Trigger { progress_ns: 10, job: 4, sets: Sets::Start }],
+            ),
+            piece(Release::Spawned, 10, vec![]),
+        ],
+        workers: 2,
+        wall_ns: 0,
+        idle_ns: 0,
+        last_run_ns: 0,
+        idle_to_last_run_ns: 0,
+        cost_ns: 0,
+        runs: 0,
+        woken: 0,
+        timed: 0,
+        moves: 0,
+        spawned: 4,
+        roots: 1,
+    };
+    assert_eq!(transcript.slack(), vec![0, 10, 10, 0, 0]);
+    let fifo = transcript.replay(2, Policy::Fifo, 0);
+    let slack = transcript.replay(2, Policy::Slack, 0);
+    assert_eq!((fifo.wall_ns, fifo.ended, fifo.stuck, fifo.out_of_fuel), (30, 5, 0, false));
+    assert_eq!((slack.wall_ns, slack.ended, slack.stuck, slack.out_of_fuel), (21, 5, 0, false));
+}
+
+/// Each start waits for the other's whole run, so neither can move without the other and both
+/// have slack 0.
+#[test]
+fn a_cycle_of_starts_has_no_slack() {
+    let transcript = Transcript {
+        jobs: vec![
+            piece(
+                Release::At { ns: 0 },
+                5,
+                vec![Trigger { progress_ns: 5, job: 1, sets: Sets::Start }],
+            ),
+            piece(Release::Spawned, 5, vec![Trigger { progress_ns: 5, job: 0, sets: Sets::Start }]),
+        ],
+        workers: 1,
+        wall_ns: 0,
+        idle_ns: 0,
+        last_run_ns: 0,
+        idle_to_last_run_ns: 0,
+        cost_ns: 0,
+        runs: 0,
+        woken: 0,
+        timed: 0,
+        moves: 0,
+        spawned: 1,
+        roots: 1,
+    };
+    assert_eq!(transcript.slack(), vec![0, 0]);
+}

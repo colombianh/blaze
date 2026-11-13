@@ -17,6 +17,7 @@
 //!
 //! Calibrated on the record it came from (the same cores, today's policy), the predicted idle
 //! share should be the measured one; a change of cores or policy then says what it would buy.
+//! [`Policy::Slack`] takes the runnable job that can wait the least ([`Transcript::slack`]).
 
 use std::{
     cmp::Reverse,
@@ -33,6 +34,9 @@ pub enum Policy {
     Fifo,
     /// The one made runnable last.
     Lifo,
+    /// The least slack against the critical path ([`Transcript::slack`]), and the one made
+    /// runnable first when the slack is equal.
+    Slack,
 }
 
 impl Policy {
@@ -40,6 +44,7 @@ impl Policy {
         match self {
             Policy::Fifo => "fifo",
             Policy::Lifo => "lifo",
+            Policy::Slack => "slack",
         }
     }
 }
@@ -284,6 +289,12 @@ impl Transcript {
         it
     }
 
+    /// Slack of each job against the unconstrained critical path, in nanoseconds: how long it
+    /// can wait without moving that path's end. See [`job_slack`].
+    pub fn slack(&self) -> Vec<i64> {
+        job_slack(&self.jobs)
+    }
+
     /// The driver's cost per run in the record: the workers' time neither idle nor running a
     /// job, over the runs. 0 when the record has no workers or no runs.
     pub fn overhead_ns(&self) -> i64 {
@@ -329,6 +340,149 @@ impl Transcript {
             predicted,
         }
     }
+}
+
+/// How long each job can wait without moving the unconstrained critical path.
+///
+/// A [`Sets::Start`] trigger is a start-to-start edge at that progress, capped at the
+/// spawner's run cost. A [`Sets::Wake`] trigger does not delay the waiter's start; it counts
+/// the waiter's run cost on the waker's path, so a waker is as critical as the work it
+/// unblocks. A path longer than every job's run cost added counts some job twice, which is a
+/// cycle, and a job on one has slack 0.
+fn job_slack(jobs: &[Job]) -> Vec<i64> {
+    let n = jobs.len();
+    // alloc: once a slack
+    let d: Vec<i64> = jobs.iter().map(run_cost).collect();
+    let work: i64 = d.iter().copied().fold(0, i64::saturating_add);
+    let mut latest_release = 0i64;
+    for job in jobs {
+        if let Release::At { ns } = job.release {
+            latest_release = latest_release.max(ns.max(0));
+        }
+    }
+    let es_cap = latest_release.saturating_add(work);
+    // alloc: once a slack
+    let mut es = vec![0i64; n];
+    for (j, job) in jobs.iter().enumerate() {
+        if let Release::At { ns } = job.release {
+            es[j] = ns.max(0);
+        }
+    }
+    // alloc: once a slack
+    let mut cyclic = vec![false; n];
+    let mut settled = false;
+    for _ in 0..n {
+        let mut changed = false;
+        for (i, job) in jobs.iter().enumerate() {
+            for trigger in &job.triggers {
+                if !matches!(trigger.sets, Sets::Start) {
+                    continue;
+                }
+                let j = trigger.job as usize;
+                if j >= n {
+                    continue;
+                }
+                let lag = trigger.progress_ns.max(0).min(d[i]);
+                let next = es[i].saturating_add(lag);
+                if next > es_cap {
+                    cyclic[i] = true;
+                    cyclic[j] = true;
+                } else if next > es[j] {
+                    es[j] = next;
+                    changed = true;
+                } else if cyclic[j] {
+                    cyclic[i] = true;
+                }
+            }
+        }
+        if !changed {
+            settled = true;
+            break;
+        }
+    }
+    if !settled {
+        for (i, job) in jobs.iter().enumerate() {
+            for trigger in &job.triggers {
+                if !matches!(trigger.sets, Sets::Start) {
+                    continue;
+                }
+                let j = trigger.job as usize;
+                if j >= n {
+                    continue;
+                }
+                let lag = trigger.progress_ns.max(0).min(d[i]);
+                if es[i].saturating_add(lag) > es[j] {
+                    cyclic[i] = true;
+                    cyclic[j] = true;
+                }
+            }
+        }
+    }
+    // alloc: once a slack
+    let mut bl = d.clone();
+    settled = false;
+    for _ in 0..n {
+        let mut changed = false;
+        for (i, job) in jobs.iter().enumerate() {
+            for trigger in &job.triggers {
+                let j = trigger.job as usize;
+                if j >= n {
+                    continue;
+                }
+                let lag = trigger.progress_ns.max(0).min(d[i]);
+                let next = lag.saturating_add(bl[j]);
+                if cyclic[j] || next > work {
+                    cyclic[i] = true;
+                    cyclic[j] = true;
+                } else if next > bl[i] {
+                    bl[i] = next;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            settled = true;
+            break;
+        }
+    }
+    if !settled {
+        for (i, job) in jobs.iter().enumerate() {
+            for trigger in &job.triggers {
+                let j = trigger.job as usize;
+                if j >= n {
+                    continue;
+                }
+                let lag = trigger.progress_ns.max(0).min(d[i]);
+                if lag.saturating_add(bl[j]) > bl[i] {
+                    cyclic[i] = true;
+                    cyclic[j] = true;
+                }
+            }
+        }
+    }
+    let mut horizon = 0i64;
+    for j in 0..n {
+        if !cyclic[j] {
+            horizon = horizon.max(es[j].saturating_add(bl[j]));
+        }
+    }
+    // alloc: once a slack
+    let mut out = vec![0i64; n];
+    for j in 0..n {
+        if !cyclic[j] {
+            out[j] = horizon.saturating_sub(es[j].saturating_add(bl[j]));
+        }
+    }
+    out
+}
+
+fn run_cost(job: &Job) -> i64 {
+    job.segments.iter().fold(0, |sum, segment| {
+        sum.saturating_add(match segment {
+            Segment::Run { ns } => *ns,
+            Segment::Wait { .. } => 0,
+        })
+    })
 }
 
 fn share(ns: i64, cores: u32, wall_ns: i64) -> f64 {
@@ -402,6 +556,8 @@ struct JobState {
 struct Replay<'a> {
     transcript: &'a Transcript,
     policy: Policy,
+    /// [`Transcript::slack`] under [`Policy::Slack`]; empty for the other policies.
+    slack: Vec<i64>,
     overhead_ns: i64,
     events: BinaryHeap<Reverse<(i64, u64, Ev)>>,
     seq: u64,
@@ -420,9 +576,15 @@ struct Replay<'a> {
 impl<'a> Replay<'a> {
     fn new(transcript: &'a Transcript, cores: u32, policy: Policy, overhead_ns: i64) -> Replay<'a> {
         let n = transcript.jobs.len();
+        // alloc: once a replay, and only the slack policy asks for it
+        let slack = match policy {
+            Policy::Slack => transcript.slack(),
+            Policy::Fifo | Policy::Lifo => Vec::new(),
+        };
         let mut it = Replay {
             transcript,
             policy,
+            slack,
             overhead_ns,
             // alloc: once a replay
             events: BinaryHeap::with_capacity(n),
@@ -457,6 +619,17 @@ impl<'a> Replay<'a> {
             .map(|it| 2 + it.segments.len() + it.triggers.len())
             .sum::<usize>()
             + 16
+    }
+
+    /// The runnable job with the least slack, and the oldest when the slack is equal.
+    fn take_least_slack(&mut self) -> Option<u32> {
+        let at = self
+            .ready
+            .iter()
+            .enumerate()
+            .min_by_key(|(i, j)| (self.slack.get(**j as usize).copied().unwrap_or(0), *i))
+            .map(|(at, _)| at)?;
+        self.ready.remove(at)
     }
 
     fn push(&mut self, t: i64, ev: Ev) {
@@ -495,6 +668,7 @@ impl<'a> Replay<'a> {
                 let next = match self.policy {
                     Policy::Fifo => self.ready.pop_front(),
                     Policy::Lifo => self.ready.pop_back(),
+                    Policy::Slack => self.take_least_slack(),
                 };
                 let Some(j) = next else { break };
                 self.free -= 1;
