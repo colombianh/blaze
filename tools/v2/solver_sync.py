@@ -189,12 +189,47 @@ def check_manifest(upstream: Path, vendored: Path, commit: str) -> None:
     )
 
 
+# A hunk recorded at line 1 (`@@ -1,...`) is anchored there by git 2.56: it will not
+# slide to the same context lower in the file. Upstream growing above that context is
+# still the same change. Recording the hunk far enough down makes `git apply` search
+# for the exact context, which is what "no fuzz" means.
+_HUNK = re.compile(rb"^@@ -(\d+)(,\d+)? \+(\d+)(,\d+)? @@", re.M)
+_SLIDE = 100_000
+
+
+def slide_line_one(patch: bytes) -> bytes:
+    def one(match: re.Match[bytes]) -> bytes:
+        old = int(match.group(1))
+        if old != 1:
+            return match.group(0)
+        new = int(match.group(3))
+        return b"@@ -%d%s +%d%s @@" % (
+            _SLIDE,
+            match.group(2) or b"",
+            _SLIDE + new - old,
+            match.group(4) or b"",
+        )
+
+    return _HUNK.sub(one, patch)
+
+
 def apply(crate: str, name: str, patch: Path, tree: Path, commit: str) -> None:
     """`patch` applied to `tree`, or an error naming it (and whether upstream already has it)."""
     step = f"{crate}: {name}"
     check = git(step, "apply", "--check", str(patch), cwd=tree, ok=(0, 1, 128), ceiling=tree)
+    using = patch
+    if check.returncode != 0:
+        slid = slide_line_one(patch.read_bytes())
+        if slid != patch.read_bytes():
+            with tempfile.NamedTemporaryFile(prefix="solver-sync-", suffix=".patch") as held:
+                held.write(slid)
+                held.flush()
+                again = git(step, "apply", "--check", held.name, cwd=tree, ok=(0, 1, 128), ceiling=tree)
+                if again.returncode == 0:
+                    git(step, "apply", held.name, cwd=tree, ceiling=tree)
+                    return
     if check.returncode == 0:
-        git(step, "apply", str(patch), cwd=tree, ceiling=tree)
+        git(step, "apply", str(using), cwd=tree, ceiling=tree)
         return
     said = "\n".join(check.stderr.decode(errors="replace").splitlines()[-15:])
     reverse = git(step, "apply", "--check", "--reverse", str(patch), cwd=tree, ok=(0, 1, 128), ceiling=tree)
