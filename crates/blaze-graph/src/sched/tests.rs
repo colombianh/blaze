@@ -808,6 +808,40 @@ fn a_thief_takes_half_a_queue() {
 }
 
 #[test]
+fn a_parked_core_is_handed_the_tighter_waiter() {
+    let mut sched = Sched::new(Cores::flat(4).unwrap(), 16);
+    let start = |sched: &mut Sched, job: u32, core: u32, slack: u64| {
+        sched.spawn(
+            JobId(job),
+            Spawn::root().hint(Affinity::Core(CoreId(core))).slack(slack),
+        );
+        assert_eq!(decisions(sched), [wake(core, job)]);
+        sched.core_idle(CoreId(core));
+        assert_eq!(decisions(sched), [run(core, job)]);
+    };
+    start(&mut sched, 0, 0, 0);
+    start(&mut sched, 1, 1, 8);
+    start(&mut sched, 2, 2, 4);
+    start(&mut sched, 3, 3, 1);
+    assert_eq!(sched.suspended(JobId(1), Wait::Job(JobId(0))), Ok(Suspend::Waiting));
+    assert_eq!(sched.suspended(JobId(2), Wait::Job(JobId(0))), Ok(Suspend::Waiting));
+    assert_eq!(sched.suspended(JobId(3), Wait::Job(JobId(0))), Ok(Suspend::Waiting));
+    sched.done(JobId(0));
+    let got = decisions(&mut sched);
+    let handed: Vec<u32> = got
+        .iter()
+        .filter_map(|it| match it {
+            Decision::Wake { job, .. } | Decision::Run { job, .. } => Some(job.0),
+            _ => None,
+        })
+        .collect();
+    let tight = handed.iter().position(|job| *job == 3);
+    let loose = handed.iter().position(|job| *job == 1);
+    assert!(tight.is_some() && loose.is_some() && tight < loose, "{got:?}");
+    sched.audit();
+}
+
+#[test]
 fn a_job_made_runnable_goes_to_the_nearest_parked_core() {
     let mut sched = Sched::new(two_nodes(), 32);
     all_busy(&mut sched);

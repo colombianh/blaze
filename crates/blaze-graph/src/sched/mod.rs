@@ -1248,18 +1248,36 @@ impl Place {
         job
     }
 
-    /// The oldest job `core` holds, critical ones first: what a parked core is handed.
+    /// The tightest job `core` holds, critical ones first, the oldest when the slack is equal:
+    /// what a parked core is handed.
     fn take_oldest(&mut self, core: u32) -> u32 {
         let c = core as usize;
-        let job = self.urgent[c]
-            .pop_front()
-            .or_else(|| self.queue[c].pop_front())
-            .or_else(|| self.inbox[c].pop_front())
-            .or_else(|| (self.slot[c] != NONE).then(|| std::mem::replace(&mut self.slot[c], NONE)))
-            .or_else(|| self.later[c].pop_front())
-            .expect("a stealable core has a job");
+        let job = if !self.urgent[c].is_empty() {
+            self.pull_least_slack(c, true)
+        } else if !self.queue[c].is_empty() {
+            self.pull_least_slack(c, false)
+        } else if let Some(job) = self.inbox[c].pop_front() {
+            job
+        } else if self.slot[c] != NONE {
+            std::mem::replace(&mut self.slot[c], NONE)
+        } else if !self.later[c].is_empty() {
+            self.pull_least_slack_later(c)
+        } else {
+            panic!("a stealable core has a job")
+        };
         self.refresh(core);
         job
+    }
+
+    /// As [`Place::pull_least_slack`] for the background queue.
+    fn pull_least_slack_later(&mut self, core: usize) -> u32 {
+        let at = self.later[core]
+            .iter()
+            .enumerate()
+            .min_by_key(|&(i, &job)| (self.slack[job as usize], i))
+            .map(|(at, _)| at)
+            .expect("a background queue has a job");
+        self.later[core].remove(at).expect("the index is in the queue")
     }
 
     /// While a core is parked, `core`'s stealable jobs go one each to the nearest parked cores.
