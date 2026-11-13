@@ -50,6 +50,23 @@ fn profile() -> Profile {
     Profile { incremental: true, ..Profile::dev() }
 }
 
+#[test]
+fn a_units_dev_and_release_builds_share_its_cost() {
+    let dev = unit(P, target("p", "lib", "src/lib.rs"), Mode::Build, &[]);
+    let mut release = dev.clone();
+    release.profile.name = "release".to_owned();
+    release.profile.opt_level = "3".to_owned();
+    let codegen = super::Phase::Codegen;
+    assert_eq!(super::cost_key(&dev, Some(codegen)), super::cost_key(&release, Some(codegen)));
+    let mut other = release.clone();
+    other.pkg_id = Z.to_owned();
+    assert_ne!(super::cost_key(&release, Some(codegen)), super::cost_key(&other, Some(codegen)));
+    assert_ne!(
+        super::cost_key(&release, Some(codegen)),
+        super::cost_key(&release, Some(super::Phase::Link)),
+    );
+}
+
 fn unit(pkg: &str, target: Target, mode: Mode, deps: &[usize]) -> Unit {
     Unit {
         pkg_id: pkg.to_owned(),

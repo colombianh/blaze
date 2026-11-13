@@ -1765,14 +1765,16 @@ pub(crate) fn program_key(unit: &Unit, asked: bool, phase: Phase) -> Option<blaz
 
 /// The key phase `phase` of `unit` (`None` for a build script's run) is predicted and taught
 /// by (`plane::Plane::push_learned`), where it is not a program's ([`program_key`]): the same
-/// unit of the same profile, platform and mode has the same key in every build and daemon, so
-/// its node costs what its own last runs that did work took, which the daemon's image keeps: a
-/// run of a fresh unit replays its record and teaches nothing (`plane::Plane::replays`). Its
-/// memory is never under its kind's predicted peak (`plane::Plane::push_learned`).
+/// unit of the same platform and mode has the same key in every build and daemon, whichever
+/// profile compiled it, so a first release build is granted what the dev build of that unit
+/// held instead of the unseen kind's default. Its node costs what its own last runs that did
+/// work took, which the daemon's image keeps: a run of a fresh unit replays its record and
+/// teaches nothing (`plane::Plane::replays`). Its memory is never under its kind's predicted
+/// peak (`plane::Plane::push_learned`).
 pub(crate) fn cost_key(unit: &Unit, phase: Option<Phase>) -> blaze_graph::Key {
-    let mut hasher = blaze_ids::Hasher::new("blaze v2 unit cost 1");
+    let mut hasher = blaze_ids::Hasher::new("blaze v2 unit cost 2");
     let platform = unit.platform.as_deref().unwrap_or("");
-    let parts = [unit.pkg_id.as_str(), &unit.target.name, &unit.profile.name, platform];
+    let parts = [unit.pkg_id.as_str(), &unit.target.name, platform];
     for part in parts.into_iter().chain(unit.target.kind.iter().map(String::as_str)) {
         hasher.update(&(part.len() as u64).to_le_bytes()).update(part.as_bytes());
     }
