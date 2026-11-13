@@ -698,6 +698,7 @@ fn a_waiter_wakes_on_the_finishing_core_ahead_of_its_queue() {
         sched.spawn(JobId(job), Spawn::child(JobId(0)));
     }
     // Job 1 waits for job 0; its core steals half of job 0's queue: job 2, the oldest.
+    // Both have no slack, so the older half is the tighter half.
     assert_eq!(sched.suspended(JobId(1), Wait::Job(JobId(0))), Ok(Suspend::Waiting));
     assert_eq!(decisions(&mut sched), [run(1, 2)]);
     // Job 0 ends on core 0: job 1 runs there next, ahead of job 3 in core 0's queue.
@@ -705,6 +706,18 @@ fn a_waiter_wakes_on_the_finishing_core_ahead_of_its_queue() {
     assert_eq!(decisions(&mut sched), [run(0, 1)]);
     sched.done(JobId(1));
     assert_eq!(decisions(&mut sched), [run(0, 3)]);
+    sched.audit();
+}
+
+/// The older queued job can wait. A steal takes the newer one, which cannot.
+#[test]
+fn a_steal_takes_the_tighter_job_not_the_older_one() {
+    let mut sched = Sched::new(Cores::flat(2).unwrap(), 8);
+    all_busy(&mut sched);
+    sched.spawn(JobId(2), Spawn::child(JobId(0)).slack(5));
+    sched.spawn(JobId(3), Spawn::child(JobId(0)));
+    assert_eq!(sched.suspended(JobId(1), Wait::Job(JobId(0))), Ok(Suspend::Waiting));
+    assert_eq!(decisions(&mut sched), [run(1, 3)]);
     sched.audit();
 }
 

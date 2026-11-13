@@ -1173,8 +1173,9 @@ impl Place {
             .map(|(at, _)| at)
     }
 
-    /// The nearest core with work, tier by tier; the thief runs the oldest of half its queue
-    /// and keeps the rest.
+    /// The nearest core with work, tier by tier. The thief takes the half with the least slack,
+    /// oldest first when the slack is equal, runs the first of that half, and leaves the rest
+    /// queued on the victim.
     #[blaze::nonblocking]
     fn steal_for(&mut self, thief: u32) -> Option<u32> {
         let start = thief as usize + 1;
@@ -1199,6 +1200,22 @@ impl Place {
         Some(self.steal_half(thief, victim))
     }
 
+    /// The least-slack job in `core`'s urgent or request queue, the oldest when the slack is
+    /// equal, removed from that queue.
+    fn pull_least_slack(&mut self, core: usize, urgent: bool) -> u32 {
+        let at = {
+            let queue = if urgent { &self.urgent[core] } else { &self.queue[core] };
+            queue
+                .iter()
+                .enumerate()
+                .min_by_key(|&(i, &job)| (self.slack[job as usize], i))
+                .map(|(at, _)| at)
+                .expect("a victim's queue has a job")
+        };
+        let queue = if urgent { &mut self.urgent[core] } else { &mut self.queue[core] };
+        queue.remove(at).expect("the index is in the queue")
+    }
+
     #[blaze::nonblocking]
     fn steal_half(&mut self, thief: u32, victim: u32) -> u32 {
         let (t, v) = (thief as usize, victim as usize);
@@ -1209,11 +1226,12 @@ impl Place {
             self.queue[v].is_empty() && !self.urgent[v].is_empty()
         };
         let job = if from_urgent || !self.queue[v].is_empty() {
-            let queues = if from_urgent { &mut self.urgent } else { &mut self.queue };
-            let take = queues[v].len().div_ceil(2);
-            let first = queues[v].pop_front().expect("a victim's queue has a job");
+            let take = if from_urgent { self.urgent[v].len() } else { self.queue[v].len() };
+            let take = take.div_ceil(2);
+            let first = self.pull_least_slack(v, from_urgent);
             for _ in 1..take {
-                let job = queues[v].pop_front().expect("half a queue is in it");
+                let job = self.pull_least_slack(v, from_urgent);
+                let queues = if from_urgent { &mut self.urgent } else { &mut self.queue };
                 queues[t].push_back(job);
                 self.jobs[job as usize].core = thief;
             }
