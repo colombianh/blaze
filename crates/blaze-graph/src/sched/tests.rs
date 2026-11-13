@@ -1257,6 +1257,18 @@ fn promotion_runs_before_upkeep() {
     sched.audit();
 }
 
+/// Within one band, less slack runs first. Last-in would take job 2; it can wait, so job 1 runs.
+#[test]
+fn less_slack_runs_before_a_newer_job_of_the_same_band() {
+    let mut sched = Sched::new(Cores::flat(1).unwrap(), 8);
+    all_busy(&mut sched);
+    sched.spawn(JobId(1), Spawn::child(JobId(0)).slack(0));
+    sched.spawn(JobId(2), Spawn::child(JobId(0)).slack(5));
+    sched.done(JobId(0));
+    assert_eq!(decisions(&mut sched), [run(0, 1)]);
+    sched.audit();
+}
+
 /// Job 0 waits for its background child, queued behind two normal ones: the wait raises it, and
 /// it runs next.
 #[test]

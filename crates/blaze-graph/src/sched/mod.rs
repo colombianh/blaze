@@ -15,7 +15,10 @@
 //! Policy:
 //! - One queue per core, and one for its critical-path jobs, taken first. A job is queued on
 //!   the core that spawned it (the owner pops newest, as Chase-Lev and Rayon), unless its
-//!   [`Affinity`] names another place.
+//!   [`Affinity`] names another place. Within a core's own queues a lower band runs first
+//!   and, within a band, less slack ([`Spawn::slack`]). Equal slack keeps newest-first on
+//!   the urgent and request queues and oldest-first for upkeep. The inbox and the LIFO slot
+//!   stay ahead of those queues.
 //! - A waiter wakes on the core that finished what it waited on, in that core's LIFO slot ahead
 //!   of its queues, hot in the cache that just wrote what it reads. After [`LIFO_RUNS`] slot
 //!   runs in a row the core takes its inbox and queues first, so the slot never starves them.
@@ -158,6 +161,9 @@ pub struct Spawn {
     /// Who is waiting on this job, from [`Spawn::BLOCKED`] to [`Spawn::UPKEEP`]. A wait raises
     /// the owner to the waiter's band and never lowers it.
     pub band: u8,
+    /// How long this job can wait, within its band, without moving the critical path. Less
+    /// runs first. Equal slack keeps the queue's own order.
+    pub slack: u64,
     /// The counter it counts towards until it ends.
     pub counter: Option<CounterId>,
 }
@@ -182,6 +188,7 @@ impl Spawn {
             critical: false,
             background: false,
             band: Self::REQUEST,
+            slack: 0,
             counter: None,
         }
     }
@@ -194,8 +201,15 @@ impl Spawn {
             critical: false,
             background: false,
             band: Self::REQUEST,
+            slack: 0,
             counter: None,
         }
+    }
+
+    /// [`Spawn::slack`]. Less runs first within the band.
+    pub const fn slack(mut self, slack: u64) -> Spawn {
+        self.slack = slack;
+        self
     }
 
     pub const fn hint(mut self, hint: Affinity) -> Spawn {
@@ -566,6 +580,8 @@ pub(crate) struct Place {
 
     /// By local job id.
     jobs: Vec<Job>,
+    /// [`Spawn::slack`] of each local job. Less runs first within a band.
+    slack: Vec<u64>,
     timers: Wheel<u32>,
     /// What a step collects before it acts on it: timers fired.
     scratch: Vec<u32>,
@@ -612,6 +628,7 @@ impl Place {
             critical_small: zeros(words),
             yield_sent: zeros(words),
             jobs: Vec::with_capacity(jobs),
+            slack: Vec::with_capacity(jobs),
             timers: Wheel::new(),
             scratch: Vec::with_capacity(64),
             cores,
@@ -683,11 +700,22 @@ impl Place {
 
     /// `job` is new, world id `global`; `spawner` is its parent's local id when its parent
     /// runs here.
-    fn spawn(&mut self, job: u32, global: JobId, spawner: Option<u32>, hint: Affinity, band: u8) {
+    fn spawn(
+        &mut self,
+        job: u32,
+        global: JobId,
+        spawner: Option<u32>,
+        hint: Affinity,
+        band: u8,
+        slack: u64,
+    ) {
         let critical = band <= Spawn::CRITICAL;
         let need = job as usize + 1;
         if self.jobs.len() < need {
             self.jobs.resize(need, VACANT);
+        }
+        if self.slack.len() < need {
+            self.slack.resize(need, 0);
         }
         let j = job as usize;
         assert!(
@@ -730,6 +758,7 @@ impl Place {
         };
         self.jobs[j] =
             Job { state: JobState::Queued, band, timed: false, core: home, global: global.0 };
+        self.slack[j] = slack;
         if spawner == Some(home) {
             self.enqueue(home, job);
             self.refresh(home);
@@ -1131,14 +1160,15 @@ impl Place {
         job
     }
 
-    /// The queue index of the lowest band, and within one band the newest (`lifo`) or the oldest.
+    /// The queue index of the lowest band, then the least slack, and within that the newest
+    /// (`lifo`) or the oldest.
     fn best(&self, queue: &std::collections::VecDeque<u32>, lifo: bool) -> Option<usize> {
         queue
             .iter()
             .enumerate()
             .min_by_key(|&(i, &job)| {
                 let order = if lifo { usize::MAX - i } else { i };
-                (self.jobs[job as usize].band, order)
+                (self.jobs[job as usize].band, self.slack[job as usize], order)
             })
             .map(|(at, _)| at)
     }
@@ -1735,7 +1765,7 @@ impl World {
             (home.member == member).then_some(home.local)
         });
         assert!(self.graph.life(job) != Life::Live, "job {} spawned while it is live", job.0);
-        self.place_mut(member).spawn(local, job, spawner, how.hint, how.band);
+        self.place_mut(member).spawn(local, job, spawner, how.hint, how.band, how.slack);
         self.graph.add(job, Home { member, local }, how.counter);
         self.touch(member);
     }
