@@ -3,6 +3,7 @@
 
 mod apply;
 mod capabilities;
+mod component;
 mod drop_effects;
 mod effects;
 mod facts;

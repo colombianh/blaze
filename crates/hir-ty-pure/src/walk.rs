@@ -102,7 +102,7 @@ pub(crate) struct Deferred {
 }
 
 /// What one instance does, its callees' included.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Summary {
     pub(crate) effects: Effects,
     /// The variables it reads, each allowed, sorted, each once.
@@ -545,37 +545,223 @@ fn step_key(body: Body, args: &StoredGenericArgs) -> u128 {
     (kind << 64) | (u128::from(id.as_u32()) << 32) | u128::from(args.as_ref().index())
 }
 
-/// What the instance does, in `env`. A cycle of instances starts from the summary of a
-/// recursion ([`Summary::recursive`]) and iterates to its fixpoint: each local's value only
-/// rises, in a lattice three high, and the recursion's witness keeps one depth.
-#[blaze_query::tracked(returns(ref), cycle_initial = |_, _, _, _| Summary::recursive())]
+/// What the instance does, in `env`. A cycle of instances is one component: one query owns
+/// every member and publishes them together, and any other asker waits on that query. An
+/// instance that no call reaches again is still its own summary.
+#[blaze_query::tracked(returns(ref))]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
 )]
 pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Summary {
     let Some(body) = body_of(db, &env, &instance) else { return Summary::default() };
-    match body {
-        Ok(body) => {
-            let cx = Cx::new(db, env);
-            summarize(&cx, body, instance.def)
+    let Err(error) = body else {
+        let key = component_key(db, env.clone(), instance.clone()).clone();
+        if key.cyclic {
+            let rows = component_in(db, env, key.rep);
+            return rows
+                .iter()
+                .find(|(it, _)| it == &instance)
+                .map(|(_, summary)| summary.clone())
+                .unwrap_or_else(|| {
+                    // alloc: the panic's message, once
+                    panic!("the component of {} has no row for it", name_of(db, &instance))
+                });
         }
-        Err(error) => {
-            let what = format!("has a body that does not lower to MIR: {error:?}"); // alloc: an impure script's reason, once
-            let trust = effect_attrs::crate_trust(db, def_crate(db, instance.def));
-            let mut own = Own::trusted(trust);
-            own.add(EffectSet::one(Rule::Unchecked), &what, None, trust);
-            let (sets, witnesses) = own.into_sets();
-            Summary {
-                impure: Some(Box::new(Impure { what, through: Vec::new() })), // alloc: an impure summary's reason, kept out of line
-                kinds: EffectSet::one(Rule::Unchecked),
-                sets,
-                witnesses,
-                memory: MemoryEffects::UNKNOWN,
-                ..Summary::default()
+        let cx = Cx::new(db, env);
+        let Some(Ok(body)) = body_of(db, &cx.stored, &instance) else {
+            return Summary::default();
+        };
+        return summarize(&cx, body, instance.def, None);
+    };
+    unchecked_body(db, &instance, &error)
+}
+
+/// One strongly connected component of the call graph, named by its representative: the member
+/// [`body_rank`] orders first. `live` is set only on the provisional value a re-entered query
+/// returns; a stored value never has it. `cyclic` is set once the instance is in a component
+/// of more than its own acyclic self.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Comp {
+    pub(crate) rep: Instance,
+    pub(crate) live: bool,
+    pub(crate) cyclic: bool,
+}
+
+fn body_rank(instance: &Instance) -> u128 {
+    match instance.def {
+        Def::Body(body) => step_key(body, &instance.args),
+        Def::Leaf(..) => u128::MAX,
+    }
+}
+
+/// The call targets of `instance`: every body [`Walk::walk`] would ask the summary of, and not
+/// their effects. Listed once, in [`body_rank`] order.
+#[blaze_query::tracked(returns(ref))]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+)]
+fn calls_of(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Vec<Instance> {
+    let Some(Ok(body)) = body_of(db, &env, &instance) else { return Vec::new() };
+    let cx = Cx::new(db, env);
+    let mut walk = Walk::new(&cx, Some(body));
+    walk.listing = true;
+    walk.gather(body);
+    let mut out = Vec::new(); // alloc: the instance's callees, once
+    for site in &walk.sites {
+        let Reached::Walk(callee, _) = &site.reached else { continue };
+        if matches!(callee.def, Def::Body(_)) {
+            out.push(callee.clone()); // clone: reference counts
+        }
+    }
+    out.sort_by_key(body_rank);
+    out.dedup();
+    out
+}
+
+/// Whether `target` is reachable from `from` along [`calls_of`], `from` included.
+fn reaches(db: &Db, env: &StoredParamEnvAndCrate, from: &Instance, target: &Instance) -> bool {
+    let mut seen: HashSet<Instance, Global> = HashSet::new_in(Global); // alloc: the search, once a join is asked
+    let mut stack = vec![from.clone()]; // clone: reference counts
+    while let Some(at) = stack.pop() {
+        if !seen.insert(at.clone()) {
+            continue;
+        }
+        if &at == target {
+            return true;
+        }
+        // clone: the callee list, so the query ref is not held across the next read
+        let calls = calls_of(db, env.clone(), at).clone();
+        stack.extend(calls);
+    }
+    false
+}
+
+fn settle_comp(
+    _db: &Db,
+    _cycle: &blaze_query::db::Cycle<'_>,
+    last: &Comp,
+    new: Comp,
+    _env: StoredParamEnvAndCrate,
+    _instance: Instance,
+) -> Comp {
+    let rep = if body_rank(&new.rep) < body_rank(&last.rep) { new.rep } else { last.rep.clone() };
+    Comp { rep, live: false, cyclic: last.cyclic || new.cyclic }
+}
+
+/// The component `instance` belongs to. Acyclic instances name themselves with `cyclic` clear.
+/// A cycle's members all name the same representative. A re-entered call is `live`, which is
+/// how the caller on the cycle tells a back edge from a finished component.
+#[blaze_query::tracked(
+    returns(ref),
+    cycle_initial = |_, _, _, instance: Instance| Comp { rep: instance, live: true, cyclic: true },
+    cycle_fn = settle_comp,
+)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+)]
+pub(crate) fn component_key(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Comp {
+    // clone: the callee list, dropped before the recursive asks
+    let calls = calls_of(db, env.clone(), instance.clone()).clone();
+    let mut rep = instance.clone();
+    let mut cyclic = false;
+    for callee in calls {
+        let their = component_key(db, env.clone(), callee).clone();
+        let join = their.live || (their.cyclic && reaches(db, &env, &their.rep, &instance));
+        if join {
+            cyclic = true;
+            if body_rank(&their.rep) < body_rank(&rep) {
+                rep = their.rep;
             }
         }
     }
+    Comp { rep, live: false, cyclic }
+}
+
+/// The members whose representative is `rep`, found by walking callees and keeping those that
+/// name it. `rep` itself is a member.
+fn members_of(db: &Db, env: &StoredParamEnvAndCrate, rep: &Instance) -> Vec<Instance> {
+    let mut out = Vec::new(); // alloc: the component, once
+    let mut seen: HashSet<Instance, Global> = HashSet::new_in(Global);
+    let mut stack = vec![rep.clone()]; // clone: reference counts
+    while let Some(at) = stack.pop() {
+        if !seen.insert(at.clone()) {
+            continue;
+        }
+        let key = component_key(db, env.clone(), at.clone()).clone();
+        if key.rep != *rep {
+            continue;
+        }
+        out.push(at.clone());
+        let calls = calls_of(db, env.clone(), at).clone();
+        stack.extend(calls);
+    }
+    out.sort_by_key(body_rank);
+    out
+}
+
+fn unchecked_body(db: &Db, instance: &Instance, error: &impl std::fmt::Debug) -> Summary {
+    let what = format!("has a body that does not lower to MIR: {error:?}"); // alloc: an impure script's reason, once
+    let trust = effect_attrs::crate_trust(db, def_crate(db, instance.def));
+    let mut own = Own::trusted(trust);
+    own.add(EffectSet::one(Rule::Unchecked), &what, None, trust);
+    let (sets, witnesses) = own.into_sets();
+    Summary {
+        impure: Some(Box::new(Impure { what, through: Vec::new() })), // alloc: an impure summary's reason, kept out of line
+        kinds: EffectSet::one(Rule::Unchecked),
+        sets,
+        witnesses,
+        memory: MemoryEffects::UNKNOWN,
+        ..Summary::default()
+    }
+}
+
+/// Every member of the component named by `rep`, brought to the fixpoint on this task. Callees
+/// outside the component are asked as their own summaries; members are read from the round's map,
+/// so a second asker of any member waits here and does not run another round.
+#[blaze_query::tracked(returns(ref))]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+)]
+pub(crate) fn component_in(
+    db: &Db,
+    env: StoredParamEnvAndCrate,
+    rep: Instance,
+) -> Vec<(Instance, Summary)> {
+    let members = members_of(db, &env, &rep);
+    let cx = Cx::new(db, env.clone());
+    let mut known: HashMap<Instance, Summary, Global> = HashMap::new_in(Global); // alloc: one summary per member, for the fixpoint
+    for member in &members {
+        known.insert(member.clone(), Summary::recursive());
+    }
+    // Effects are a finite bit set and values rise to `Unknown`. Each round lifts something
+    // or the component has settled. The bound is the panic if a witness oscillates.
+    let bound = members.len().saturating_mul(40).max(8);
+    for _ in 0..bound {
+        let mut changed = false;
+        for member in &members {
+            let Some(Ok(body)) = body_of(db, &env, member) else { continue };
+            let next = summarize(&cx, body, member.def, Some(&known));
+            if known.get(member) != Some(&next) {
+                known.insert(member.clone(), next);
+                changed = true;
+            }
+        }
+        if !changed {
+            return members
+                .into_iter()
+                .map(|member| {
+                    let summary = known.remove(&member).unwrap_or_default();
+                    (member, summary)
+                })
+                .collect();
+        }
+    }
+    // alloc: the panic's message, once
+    panic!("the component of {} did not settle in {bound} rounds", name_of(db, &rep))
 }
 
 /// The kinds an effect keeps in a summary's set: those it refuses, and [`Rule::Open`], which a
@@ -765,6 +951,11 @@ struct Walk<'a, 'db> {
     workspace: bool,
     /// Functions trusted for some effect called with no site (Summary::trusted_calls).
     trusted_calls: SmallVec<[FunctionId; 2]>,
+    /// Summaries this fixpoint has already decided. A callee in the map is not asked as a
+    /// query: that ask would be a second task on a member of the same component.
+    known: Option<&'a HashMap<Instance, Summary, Global>>,
+    /// List call targets only. Their return value is [`Abs::Unset`], and no summary is asked.
+    listing: bool,
     dropped: HashSet<Ty<'db>, Global>,
     statics: HashSet<StaticId, Global>,
     code: HashMap<(Ty<'db>, Reach), bool, Global>,
@@ -774,9 +965,15 @@ struct Walk<'a, 'db> {
     owned_dyns: HashMap<Ty<'db>, bool, Global>,
 }
 
-fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
+fn summarize<'db>(
+    cx: &Cx<'db>,
+    body: &MirBody<'db>,
+    def: Def,
+    known: Option<&HashMap<Instance, Summary, Global>>,
+) -> Summary {
     let db = cx.db;
     let mut walk = Walk::new(cx, Some(body));
+    walk.known = known;
     walk.gather(body);
     // A closure's or `async` block's `unsafe` is its function's: one scan of the function's
     // source, which holds them.
@@ -815,9 +1012,15 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
                 memory::leaf_memory(leaf)
             }
             Def::Body(def) => {
-                let callee = summary(db, cx.stored.clone(), instance.clone()); // clone: the query's key, reference counts
-                fold.callee(db, def, instance.args.as_ref(), callee, walk.workspace, at);
-                callee.memory
+                if let Some(callee) = known.and_then(|map| map.get(instance)) {
+                    fold.callee(db, def, instance.args.as_ref(), callee, walk.workspace, at);
+                    callee.memory
+                } else {
+                    // clone: the query's key, reference counts
+                    let callee = summary(db, cx.stored.clone(), instance.clone());
+                    fold.callee(db, def, instance.args.as_ref(), callee, walk.workspace, at);
+                    callee.memory
+                }
             }
         };
         if !site.given {
@@ -843,8 +1046,13 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
         match instance.def {
             Def::Leaf(func, leaf) => out.leaf(db, func, leaf, &params, None),
             _ => {
-                let callee = summary(db, cx.stored.clone(), instance.clone()); // clone: the query's key, reference counts
-                out.callee(db, instance, callee, &params);
+                if let Some(callee) = known.and_then(|map| map.get(instance)) {
+                    out.callee(db, instance, callee, &params);
+                } else {
+                    // clone: the query's key, reference counts
+                    let callee = summary(db, cx.stored.clone(), instance.clone());
+                    out.callee(db, instance, callee, &params);
+                }
             }
         }
         callees.push(instance.clone()); // clone: reference counts
@@ -1362,6 +1570,8 @@ impl<'a, 'db> Walk<'a, 'db> {
             calls: vec![CallKind::Sites; body.map_or(0, |it| it.basic_blocks.len())],
             workspace: body.is_some_and(|it| effects::workspace(cx.db, it.owner.krate(cx.db))),
             trusted_calls: SmallVec::new(),
+            known: None,
+            listing: false,
             dropped: HashSet::new_in(Global),
             statics: HashSet::new_in(Global),
             code: HashMap::new_in(Global),
@@ -1450,7 +1660,8 @@ impl<'a, 'db> Walk<'a, 'db> {
         }
         let was = self.span.take();
         if FunctionSignature::of(db, func).is_unsafe() {
-            let what = format!("is {}, an `unsafe fn`, whose body is `unsafe` code", fn_name(db, func)); // alloc: a witness's text, once
+            let what =
+                format!("is {}, an `unsafe fn`, whose body is `unsafe` code", fn_name(db, func)); // alloc: a witness's text, once
             self.observe(EffectSet::one(Rule::Unsafe), &what);
         }
         let owner = DefWithBodyId::FunctionId(func);
@@ -1621,6 +1832,19 @@ impl<'a, 'db> Walk<'a, 'db> {
         }
     }
 
+    /// The callee's return: this fixpoint's value when the callee is a member, [`Abs::Unset`]
+    /// while only the call targets are listed, otherwise the callee's summary.
+    fn ret_of(&self, instance: &Instance) -> Abs {
+        if let Some(found) = self.known.and_then(|map| map.get(instance)) {
+            return found.ret;
+        }
+        if self.listing {
+            return Abs::Unset;
+        }
+        // clone: the query's key, reference counts
+        summary(self.cx.db, self.cx.stored.clone(), instance.clone()).ret
+    }
+
     fn push(&mut self, reached: Reached, call: Option<BasicBlockId>) {
         let (span, origin, given) = (self.span, self.origin, self.giving);
         self.sites.push(Site { reached, call, span, origin, given });
@@ -1641,7 +1865,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             return Flow::Unknown;
         }
         let instance = Instance { def, args: args.store() };
-        let ret = summary(self.cx.db, self.cx.stored.clone(), instance.clone()).ret; // clone: the query's key, reference counts
+        let ret = self.ret_of(&instance);
         self.push(Reached::Walk(instance, spread), call);
         Flow::Ret { ret, spread }
     }
