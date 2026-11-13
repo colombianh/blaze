@@ -94,6 +94,12 @@ impl Tiers {
         }
     }
 
+    /// These counts with every image's. An image's own goal is not kept.
+    #[must_use]
+    pub fn including(self, images: impl IntoIterator<Item = Self>) -> Self {
+        images.into_iter().fold(self, |all, image| all.with(image.optimized, image.functions))
+    }
+
     /// The share of the linked functions that are optimized, in whole percent, rounded down:
     /// 100 only when every one is. `None` when no image was linked.
     pub fn percent(&self) -> Option<u64> {
@@ -190,10 +196,7 @@ mod tests {
             "75% optimized, the rest as its package's opt-level asks",
             "`max` never says tier 0 code is optimized"
         );
-        assert_eq!(
-            Tiers::of(Goal::Edit).with(38, 100).line(),
-            "goal edit: tier 0 · 38% optimized"
-        );
+        assert_eq!(Tiers::of(Goal::Edit).with(38, 100).line(), "goal edit: tier 0 · 38% optimized");
         assert_eq!(Tiers::of(Goal::Max).with(2, 2).line(), "goal max: optimized");
     }
 
@@ -203,5 +206,14 @@ mod tests {
         assert_eq!((tiers.optimized, tiers.functions), (3, 10));
         assert_eq!(tiers.percent(), Some(30));
         assert_eq!(Tiers::of(Goal::Max).percent(), None);
+    }
+
+    #[test]
+    fn linked_images_move_the_status_line() {
+        let edit = Tiers::of(Goal::Edit);
+        assert_eq!(edit.including([]).line(), "goal edit: tier 0");
+        let linked = edit.including([edit.with(38, 100), edit.with(2, 10)]);
+        assert_eq!((linked.optimized, linked.functions), (40, 110));
+        assert_eq!(linked.line(), "goal edit: tier 0 · 36% optimized");
     }
 }

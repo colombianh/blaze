@@ -214,8 +214,15 @@ impl<'a> Seen<'a> {
             Stage::Units(_) => String::new(),      // alloc: none, empty
             stage => StageSaid(stage).to_string(), // alloc: a look, once a second
         };
-        // alloc: a look, once a second, the goal line
-        let goal = job.goal.map(|goal| blaze_api::Tiers::of(goal).line()).unwrap_or_default();
+        // alloc: a look, once a second, the goal line, counting images linked so far
+        let goal = job
+            .goal
+            .map(|goal| {
+                blaze_api::Tiers::of(goal)
+                    .including(job.links.iter().filter_map(|it| it.2))
+                    .line()
+            })
+            .unwrap_or_default();
         let model = now::Look {
             workers: look.workers,
             threads: &threads,

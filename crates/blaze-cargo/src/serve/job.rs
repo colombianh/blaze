@@ -7750,9 +7750,7 @@ impl<S: Steps> Jobs<S> {
         // The goal, with the functions of every image linked for it: an image of build-time
         // code says none, and counts in none.
         let tiers = job.goal.map(|goal| {
-            links.iter().filter_map(|it| it.2).fold(blaze_api::Tiers::of(goal), |all, image| {
-                all.with(image.optimized, image.functions)
-            })
+            blaze_api::Tiers::of(goal).including(links.iter().filter_map(|it| it.2))
         });
         let worked = Worked {
             // Given as it is said, by the daemon, when the build is explained by then
