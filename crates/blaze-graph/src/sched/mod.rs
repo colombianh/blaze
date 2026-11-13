@@ -1183,15 +1183,14 @@ impl Place {
             first_from(&self.stealable, mask, None, start).map(|victim| (level, victim))
         });
         let Some((level, victim)) = found else {
-            // Background work, oldest first, one job at a time: no core has other work.
+            // Background work, one job at a time: no core has other work. The least slack,
+            // and the oldest when the slack is equal.
             let (level, victim) = self.cores.tiers(thief).find_map(|(level, mask)| {
                 first_from(&self.stealable_later, mask, None, start).map(|victim| (level, victim))
             })?;
             self.stats.steals[level as usize] += 1;
             self.record_steal(thief, victim);
-            let job = self.later[victim as usize]
-                .pop_front()
-                .expect("a core with background work has a job in it");
+            let job = self.pull_least_slack_later(victim as usize);
             self.refresh(victim);
             return Some(job);
         };

@@ -1360,6 +1360,17 @@ fn a_critical_wait_on_a_key_raises_its_claimer_and_what_it_waits_for() {
 }
 
 #[test]
+fn a_background_steal_takes_the_tighter_job() {
+    let mut sched = Sched::new(Cores::flat(2).unwrap(), 8);
+    all_busy(&mut sched);
+    sched.spawn(JobId(2), Spawn::child(JobId(0)).background().slack(5));
+    sched.spawn(JobId(3), Spawn::child(JobId(0)).background());
+    sched.done(JobId(1));
+    assert_eq!(decisions(&mut sched), [run(1, 3)]);
+    sched.audit();
+}
+
+#[test]
 fn a_background_job_is_stolen_only_when_no_core_has_other_work() {
     let mut sched = Sched::new(Cores::flat(2).unwrap(), 8);
     all_busy(&mut sched);
