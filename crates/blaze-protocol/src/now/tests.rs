@@ -35,7 +35,27 @@ fn span(name: &str, for_ms: u64) -> Span {
 }
 
 fn look<'a>(threads: &'a [Worker], downloads: &'a [Download], memory: &'a Memory) -> Look<'a> {
-    Look { workers: 16, threads, downloads, stage: "", stall: None, memory, expanders: &[], expansion_threads: 0 }
+    Look {
+        workers: 16,
+        threads,
+        downloads,
+        stage: "",
+        goal: "",
+        stall: None,
+        memory,
+        expanders: &[],
+        expansion_threads: 0,
+    }
+}
+
+#[test]
+fn a_look_keeps_the_goal_it_was_given() {
+    let mut fold = Fold::new();
+    fold.advance_clock(0);
+    let memory = Memory::default();
+    let mut seen = look(&[], &[], &memory);
+    seen.goal = "goal edit: tier 0";
+    assert_eq!(fold.look(&seen).goal, "goal edit: tier 0");
 }
 
 fn named(now: &Now) -> Vec<&str> {
@@ -203,7 +223,11 @@ fn one_codegen_holds_back_the_build() {
     assert_eq!((now.slowest[0].task.id, now.slowest[0].ms), (0, 1000), "ties go by id");
 
     assert_eq!(now.memory.pressure(), Pressure::Over);
-    assert_eq!((now.memory.peak, now.memory.releases), (99 * GIB, 0), "counted from the first look");
+    assert_eq!(
+        (now.memory.peak, now.memory.releases),
+        (99 * GIB, 0),
+        "counted from the first look"
+    );
     assert_eq!(now.running.len(), 1);
     assert_eq!((now.running[0].task.id, now.running[0].for_ms), (u64::from(core), 270_000));
     assert_eq!(now.running[0].thread.as_deref(), Some("blaze-worker-3"));
@@ -372,6 +396,7 @@ fn a_now_is_written_in_its_keys_order_and_round_trips() {
     let now = Now {
         at_ms: 914_000,
         phase: Phase::Testing,
+        goal: String::new(),
         stage: "waits for its pinned native inputs, 1 of 1 layouts left".into(),
         stall: Some(
             "convoy: 61 behind thread 7 on lock flight.intern (oldest 2400 ms); the head is running"
@@ -412,6 +437,7 @@ fn a_now_is_written_in_its_keys_order_and_round_trips() {
             held_back: 4,
             releases: 7,
         },
+        ..Default::default()
     };
     let message = Message::new(3, &now);
     let mut writer = crate::cbor::Writer::new();

@@ -84,8 +84,8 @@ impl<S: Steps> Jobs<S> {
                 continue;
             }
             let seen = Seen::of(job, look);
-            let for_ms = u64::try_from(look.now.saturating_sub(job.began).as_millis())
-                .unwrap_or(u64::MAX);
+            let for_ms =
+                u64::try_from(look.now.saturating_sub(job.began).as_millis()).unwrap_or(u64::MAX);
             let model = seen.now(job, look, folds);
             let due = look.now.saturating_sub(job.began) >= EVERY
                 && job.doing_said.is_none_or(|at| look.now.saturating_sub(at) >= EVERY);
@@ -201,11 +201,8 @@ impl<'a> Seen<'a> {
     fn now<S: Steps>(&self, job: &Job<S>, look: &Look<'_>, folds: &mut Folds) -> Now {
         let build = self.request.unwrap_or(0);
         // alloc: a look, once a second while a build runs
-        let threads: Vec<now::Worker> = self
-            .threads
-            .iter()
-            .map(|thread| worker(thread, build))
-            .collect();
+        let threads: Vec<now::Worker> =
+            self.threads.iter().map(|thread| worker(thread, build)).collect();
         // alloc: a look, once a second, the expansion threads inside a span
         let expanders: Vec<now::Worker> = look
             .threads
@@ -214,18 +211,22 @@ impl<'a> Seen<'a> {
             .map(|thread| worker(thread, u32::MAX))
             .collect();
         let stage = match &job.stage {
-            Stage::Units(_) => String::new(), // alloc: none, empty
+            Stage::Units(_) => String::new(),      // alloc: none, empty
             stage => StageSaid(stage).to_string(), // alloc: a look, once a second
         };
+        // alloc: a look, once a second, the goal line
+        let goal = job.goal.map(|goal| blaze_api::Tiers::of(goal).line()).unwrap_or_default();
         let model = now::Look {
             workers: look.workers,
             threads: &threads,
             downloads: look.fetching,
             stage: &stage,
+            goal: &goal,
             stall: look.stall,
             memory: look.memory,
             expanders: &expanders,
-            expansion_threads: u32::try_from(blaze_macro_eval::expansion_threads()).unwrap_or(u32::MAX),
+            expansion_threads: u32::try_from(blaze_macro_eval::expansion_threads())
+                .unwrap_or(u32::MAX),
         };
         match job.request {
             Some(request) => folds.look(request, look.now, &model).unwrap_or_else(|| {
@@ -245,13 +246,7 @@ impl<'a> Seen<'a> {
     }
 
     /// The job as `blaze status` lists it, `now` its live model.
-    fn building<S: Steps>(
-        &self,
-        job: &Job<S>,
-        look: &Look<'_>,
-        for_ms: u64,
-        now: Now,
-    ) -> Building {
+    fn building<S: Steps>(&self, job: &Job<S>, look: &Look<'_>, for_ms: u64, now: Now) -> Building {
         let phase = match &job.stage {
             // alloc: a look, once a second while a build runs
             Stage::Units(build) => format!(
@@ -367,7 +362,8 @@ fn unit_doing(thread: &ThreadNow, downloads: &[Shown]) -> String {
     if thread.open.iter().any(|span| downloads_in(span.name))
         && let Some(first) = downloads.first()
     {
-        let mut said = format!("waiting on the download of {} ({}", first.what, Bytes(first.line.done)); // alloc: a look, once a second
+        let mut said =
+            format!("waiting on the download of {} ({}", first.what, Bytes(first.line.done)); // alloc: a look, once a second
         if let Some(total) = first.line.total {
             _ = write!(said, " of {}", Bytes(total));
         }

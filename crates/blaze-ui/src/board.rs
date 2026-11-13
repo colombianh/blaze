@@ -151,6 +151,8 @@ struct Mark {
     slow: bool,
     /// The daemon named a stall in its wait-for graph ([`Now::stall`]).
     locked: bool,
+    /// [`Now::goal`] was non-empty.
+    goal: bool,
 }
 
 /// Whether a block of the full form stays when the area is too short for every block.
@@ -262,6 +264,7 @@ impl Board {
             stalled: now.stalled(),
             slow: now.slow(),
             locked: now.stall.is_some(),
+            goal: !now.goal.is_empty(),
         };
         let due = match self.last {
             None => true,
@@ -272,6 +275,7 @@ impl Board {
                     || (mark.stalled && !last.stalled)
                     || (mark.slow && !last.slow)
                     || (mark.locked && !last.locked)
+                    || last.goal != mark.goal
                     || mark.at_ms >= last.at_ms.saturating_add(LINE_EVERY_MS)
             }
         };
@@ -434,6 +438,11 @@ impl Board {
             Span::raw("  "),
             Span::styled(now.phase.word(), bold()),
         ]; // alloc: a row
+        let mut left = left;
+        if !now.goal.is_empty() {
+            left.push(Span::raw("  "));
+            left.push(Span::styled(now.goal.clone(), self.dim())); // clone: a row's text
+        }
         let mut right = Vec::with_capacity(3); // alloc: a row
         if now.tally.total > 0 {
             // alloc: a row
@@ -459,6 +468,10 @@ impl Board {
         left.push(Span::styled(self.command.clone(), accent)); // clone: a row's text
         left.push(Span::raw("  "));
         left.push(Span::styled(now.phase.word(), bold()));
+        if !now.goal.is_empty() {
+            left.push(Span::raw("  "));
+            left.push(Span::styled(now.goal.clone(), self.dim())); // clone: a row's text
+        }
         if now.tally.total > 0 {
             let done = format!("  {} of {} done", now.tally.done, now.tally.total); // alloc: a row
             left.push(Span::styled(done, self.dim()));
@@ -741,7 +754,10 @@ impl Board {
         let mut rows = Vec::with_capacity(shown + 3); // alloc: a section
         rows.push(Line::default());
         let style = self.style(Color::Red).add_modifier(Modifier::BOLD);
-        rows.push(Line::from(Span::styled(format!(" failed {}", self.now.tally.failed.max(failures.len() as u32)), style))); // alloc: a row
+        rows.push(Line::from(Span::styled(
+            format!(" failed {}", self.now.tally.failed.max(failures.len() as u32)),
+            style,
+        ))); // alloc: a row
         for task in &failures[..shown] {
             let text = format!("   {} {}", task.kind, task.name); // alloc: a row's text
             rows.push(Line::from(Span::raw(fit(&text, width))));
@@ -759,6 +775,9 @@ impl Board {
             return;
         }
         put!(out, "{} {} in {}", self.command, now.phase.word(), time(now.at_ms));
+        if !now.goal.is_empty() {
+            put!(out, " ({})", now.goal);
+        }
         if now.tally.total > 0 {
             put!(out, ": {} of {} tasks done", now.tally.done, now.tally.total);
         }
@@ -825,8 +844,7 @@ impl Board {
     fn blocked(&self, width: usize) -> Vec<Line<'static>> {
         let now = &self.now;
         let blockers = &now.blockers[..self.shown(now.blockers.len(), BLOCKER_ROWS)];
-        let labels: Vec<String> =
-            blockers.iter().map(|it| fit(&label(it), width / 2)).collect(); // alloc: a section
+        let labels: Vec<String> = blockers.iter().map(|it| fit(&label(it), width / 2)).collect(); // alloc: a section
         let states: Vec<String> = blockers.iter().map(state).collect(); // alloc: a section
         let label_width = labels.iter().map(|it| text_width(it)).max().unwrap_or(0);
         let state_width = states.iter().map(|it| text_width(it)).max().unwrap_or(0);
@@ -967,11 +985,7 @@ impl Board {
             line.push(Span::styled(sep, self.dim()));
             line.push(Span::raw(name));
         }
-        vec![
-            Line::default(),
-            Line::from(Span::styled(" slowest so far", bold())),
-            Line::from(line),
-        ] // alloc: a section
+        vec![Line::default(), Line::from(Span::styled(" slowest so far", bold())), Line::from(line)] // alloc: a section
     }
 
     /// ` e expand · blaze explore for the graph · ...`, `e collapse` when expanded.
@@ -1037,6 +1051,9 @@ fn shorten(mut blocks: Vec<Block>, height: usize) -> Vec<Line<'static>> {
 fn compact(now: &Now, out: &mut String) {
     let start = out.len();
     put!(out, "[{}] {}", time(now.at_ms), now.phase.word());
+    if !now.goal.is_empty() {
+        put!(out, " · {}", now.goal);
+    }
     if now.tally.total > 0 {
         put!(out, " {} of {} done", now.tally.done, now.tally.total);
     }
@@ -1228,7 +1245,7 @@ fn per_second(n: u64) -> String {
     let (size, name) = unit(n);
     let whole = n.saturating_add(size / 2) / size;
     match size == 1 || whole >= 10 {
-        true => format!("{whole} {name}/s"),                 // alloc: a row's text
+        true => format!("{whole} {name}/s"), // alloc: a row's text
         false => format!("{} {name}/s", in_unit(n, size)), // alloc: a row's text
     }
 }

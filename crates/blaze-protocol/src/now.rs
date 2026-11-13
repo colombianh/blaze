@@ -70,6 +70,9 @@ crate::in_key_order! {
 pub struct Now {
     pub at_ms: u64,
     pub phase: Phase,
+    /// The goal and where the code stands (`goal edit: tier 0 · 38% optimized`), or empty
+    /// while the build has not said a goal.
+    pub goal: String,
     /// What the daemon says its stage waits on (`waits for its pinned native inputs, 1 of 1
     /// layouts left`), or empty while its units build.
     pub stage: String,
@@ -107,7 +110,7 @@ pub struct Now {
     /// The proc-macro expansion threads: how many there are and what the busy ones expand.
     pub expanding: Expansion,
 }
-keys [busy, at_ms, phase, stage, stall, tally, memory, recent, running, slowest, workers, blockers, failures, quiet_ms, downloads, expanding]
+keys [busy, goal, at_ms, phase, stage, stall, tally, memory, recent, running, slowest, workers, blockers, failures, quiet_ms, downloads, expanding]
 }
 
 impl Default for Phase {
@@ -271,8 +274,14 @@ pub enum State {
 
 impl State {
     /// Every state, in the order a task goes through them.
-    pub const ALL: [State; 6] =
-        [State::Waiting, State::Ready, State::Running, State::Done, State::Failed, State::Cancelled];
+    pub const ALL: [State; 6] = [
+        State::Waiting,
+        State::Ready,
+        State::Running,
+        State::Done,
+        State::Failed,
+        State::Cancelled,
+    ];
 
     /// Whether it may still move: waiting, ready or running.
     pub const fn unfinished(self) -> bool {
@@ -467,6 +476,8 @@ pub struct Look<'a> {
     pub downloads: &'a [Download],
     /// The stage's words, empty while the units build ([`Now::stage`]).
     pub stage: &'a str,
+    /// The goal line, empty when the build has not said one ([`Now::goal`]).
+    pub goal: &'a str,
     /// The daemon's top stall's line, while one lasts ([`Now::stall`]).
     pub stall: Option<&'a str>,
     /// The daemon's memory now: [`Memory::peak`] is the fold's to keep (the look's is ignored),
@@ -575,7 +586,12 @@ impl Records {
                 self.widened.clear();
                 // alloc: the widening buffer, kept from record to record.
                 self.widened.extend(deps.iter().map(|&dep| u64::from(dep)));
-                each(Record::Task { id: u64::from(*id), kind: kind.name(), name, deps: &self.widened });
+                each(Record::Task {
+                    id: u64::from(*id),
+                    kind: kind.name(),
+                    name,
+                    deps: &self.widened,
+                });
             }
             Event::Nodes { .. } => {
                 let Some(Ok(batch)) = event.nodes(&mut self.order) else { return };
@@ -775,7 +791,8 @@ impl Fold {
         };
         let busy = self.busy(look.threads);
         let running = self.running(look.threads);
-        let expanding = Expansion { threads: look.expansion_threads, busy: self.busy(look.expanders) };
+        let expanding =
+            Expansion { threads: look.expansion_threads, busy: self.busy(look.expanders) };
         let since = self.now_ns.saturating_sub(RECENT_MS * MS);
         while self.settles.front().is_some_and(|&at| at < since) {
             self.settles.pop_front();
@@ -789,6 +806,8 @@ impl Fold {
             phase,
             // alloc: the look's answer owns its strings.
             stage: look.stage.to_owned(),
+            // alloc: the look's answer owns its strings.
+            goal: look.goal.to_owned(),
             // alloc: the look's answer owns its strings; a stall's line, rare.
             stall: look.stall.map(str::to_owned),
             tally,
@@ -1019,8 +1038,7 @@ fn wrapper(span: &Span) -> bool {
     let named = |it: &str| {
         it == "job" || it.contains("submit") || it.contains("{{closure}}") || it.contains("::spawn")
     };
-    span.krate.is_none()
-        && (named(&span.name) || span.item.as_deref().is_some_and(named))
+    span.krate.is_none() && (named(&span.name) || span.item.as_deref().is_some_and(named))
 }
 
 /// The span a worker is shown by, of its open spans (outermost first, at least one), and the

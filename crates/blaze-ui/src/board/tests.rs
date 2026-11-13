@@ -27,6 +27,7 @@ fn andrew() -> Now {
     Now {
         at_ms: 914_000,
         phase: Phase::Compiling,
+        goal: String::new(),
         stage: String::new(),
         stall: None,
         tally: Tally { waiting: 80, ready: 0, running: 3, done: 487, failed: 0, total: 570 },
@@ -220,6 +221,15 @@ fn draw(board: &Board, form: Form, width: u16, height: u16) -> String {
 }
 
 /// The compact line, which must be due.
+#[test]
+fn the_line_says_the_goal() {
+    let mut now = andrew();
+    now.goal = "goal edit: tier 0".to_owned();
+    let mut board = board(now);
+    let said = line(&mut board);
+    assert!(said.contains("goal edit: tier 0"), "{said}");
+}
+
 fn line(board: &mut Board) -> String {
     let mut out = String::new();
     assert!(board.line(&mut out), "a line is due");

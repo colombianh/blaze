@@ -247,13 +247,7 @@ impl Tasks {
 
     /// The program as of `now_ns`, with `threads` the workers (`workers` of them) and `memory`
     /// the program's.
-    pub fn look(
-        &mut self,
-        now_ns: i64,
-        workers: u32,
-        threads: &[Worker],
-        memory: &Memory,
-    ) -> Now {
+    pub fn look(&mut self, now_ns: i64, workers: u32, threads: &[Worker], memory: &Memory) -> Now {
         self.clock(now_ns);
         let ms = |ns: u64| ns / 1_000_000;
         let downloads: Vec<now::Download> = self
@@ -281,6 +275,7 @@ impl Tasks {
             threads,
             downloads: &downloads,
             stage: "",
+            goal: "",
             stall: None,
             memory,
             expanders: &[],

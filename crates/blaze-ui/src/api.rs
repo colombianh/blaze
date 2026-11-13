@@ -308,7 +308,13 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
                 put!(out, "{} {on}\n", status("Waiting"));
             }
             if let Some(running) = &doing.running {
-                put!(out, "{} {running} ({} workers busy, {} idle)\n", status("Running"), doing.busy, doing.idle);
+                put!(
+                    out,
+                    "{} {running} ({} workers busy, {} idle)\n",
+                    status("Running"),
+                    doing.busy,
+                    doing.idle
+                );
             }
             for unit in &doing.units {
                 put!(out, "  {} unit {}: {}\n", paint(DIM, "doing"), unit.id, unit.doing);
@@ -543,11 +549,16 @@ pub fn work_json(worked: &Worked) -> String {
     let placed = worked.placed;
     put!(
         &mut out,
-        "}}, \"placed\": {{\"cloned\": {}, \"written\": {}, \"copied\": {}}}}}\n",
+        "}}, \"placed\": {{\"cloned\": {}, \"written\": {}, \"copied\": {}}}",
         placed.cloned,
         placed.written,
         placed.copied
     );
+    if let Some(tiers) = &worked.tiers {
+        out.push_str(", \"tiers\": ");
+        quoted(&mut out, &tiers.line());
+    }
+    out.push_str("}\n");
     out
 }
 
@@ -888,6 +899,11 @@ mod tests {
         timeline.clear();
         timeline_line(&mut timeline, &[]);
         assert_eq!(timeline, "");
+        let said = work_json(&Worked {
+            tiers: Some(blaze_api::Tiers::of(blaze_api::Goal::Edit).with(38, 100)),
+            ..worked
+        });
+        assert!(said.contains("\"tiers\": \"goal edit: tier 0 · 38% optimized\""), "{said}");
     }
 
     /// Each link is a `link:` line in the form `harness/bench.py`'s `link_kind` reads, and an
