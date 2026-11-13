@@ -461,6 +461,39 @@ pub fn release_template_key(
     (all, key)
 }
 
+/// The bodies an optimized compile read, in order: the ones it builds in, then each import's
+/// unit and the bodies that import builds in. A stored compile is reused only when a later
+/// compile reads the same list ([`ReleaseTrace::reuses`]). The store key
+/// ([`release_template_key`]) covers this list, so two traces are two keys.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ReleaseTrace {
+    reads: Vec<InstanceKey>,
+}
+
+impl ReleaseTrace {
+    /// `built_in` is this compile's own. `imported_units` and `imported_built_in` are one per
+    /// import, in the same order.
+    pub fn of(
+        built_in: &[InstanceKey],
+        imported_units: &[InstanceKey],
+        imported_built_in: &[&[InstanceKey]],
+    ) -> ReleaseTrace {
+        let mut reads = Vec::with_capacity(built_in.len() + imported_units.len());
+        reads.extend_from_slice(built_in);
+        for (unit, bodies) in imported_units.iter().zip(imported_built_in) {
+            reads.push(*unit);
+            reads.extend_from_slice(bodies);
+        }
+        ReleaseTrace { reads }
+    }
+
+    /// Whether `now` read the same bodies. A different length or a different key anywhere
+    /// refuses the stored compile.
+    pub fn reuses(&self, now: &ReleaseTrace) -> bool {
+        self.reads == now.reads
+    }
+}
+
 pub const IMPORTED_DOMAIN: &str = "blaze v2 release imported bodies 2";
 
 /// `laid` (a release compile's [`laid_out`] key) with what each import's export is made of:

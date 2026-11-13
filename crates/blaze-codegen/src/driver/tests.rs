@@ -1647,6 +1647,17 @@ fn a_release_key_covers_the_bodies_its_imports_build_in() {
     assert_eq!(key(&h), key(&h));
 }
 
+/// The same edit refuses the stored compile: the trace is what the key covers.
+#[test]
+fn an_edited_body_an_import_builds_in_does_not_reuse() {
+    let g = InstanceKey(ContentId([2; 32]));
+    let (h, edited) = ([InstanceKey(ContentId([3; 32]))], [InstanceKey(ContentId([4; 32]))]);
+    let trace = |built_in: &[InstanceKey]| ReleaseTrace::of(&[], &[g], &[built_in]);
+    assert!(trace(&h).reuses(&trace(&h)));
+    assert!(!trace(&h).reuses(&trace(&edited)));
+    assert!(!trace(&h).reuses(&trace(&[])));
+}
+
 /// A release compile's key covers each import's unit as its export is built: in a live
 /// build's tier-up the import is named by its first tier's key, while its export is built at
 /// the next tier's settings (another opt level), so a key of the name alone would keep `f`'s
