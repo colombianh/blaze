@@ -495,14 +495,18 @@ impl ReleaseTrace {
 
     /// The store record: this trace, then `template` (a [`crate::blob::encode`] blob).
     /// `// alloc: the record, one per optimized compile kept`
-    pub fn record(&self, template: &[u8]) -> Vec<u8> {
+    /// The store record: this trace, the release key those reads produced, then `template`.
+    /// The key covers every input of the compile the body list does not (its references and
+    /// their kinds). A later compile reuses the record only when both match.
+    pub fn record(&self, key: &Key, template: &[u8]) -> Vec<u8> {
         // alloc: the record, one per optimized compile kept
-        let mut out = Vec::with_capacity(4 + 8 + self.reads.len() * 32 + template.len());
+        let mut out = Vec::with_capacity(4 + 8 + self.reads.len() * 32 + 32 + template.len());
         out.extend_from_slice(&RELEASE_RECORD);
         out.extend_from_slice(&(self.reads.len() as u64).to_le_bytes());
         for read in &self.reads {
             out.extend_from_slice(&read.0.0);
         }
+        out.extend_from_slice(&key.0.0);
         out.extend_from_slice(template);
         out
     }
@@ -515,7 +519,7 @@ const RELEASE_RECORD: [u8; 4] = *b"BZR1";
 /// covers the reads. [`StoredRelease::Recorded`] is reused when its trace matches.
 pub enum StoredRelease<'a> {
     Previous(&'a [u8]),
-    Recorded { trace: ReleaseTrace, template: &'a [u8] },
+    Recorded { trace: ReleaseTrace, key: Key, template: &'a [u8] },
 }
 
 impl StoredRelease<'_> {
@@ -525,6 +529,16 @@ impl StoredRelease<'_> {
         match self {
             StoredRelease::Previous(_) => false,
             StoredRelease::Recorded { trace, .. } => trace.reuses(now),
+        }
+    }
+
+    /// Whether this record is the compile `now` would make under `key`. A previous-layout
+    /// template has no recorded reads, so the lookup refuses it. The same bodies under
+    /// another release key (other references) are another compile.
+    pub fn accepts(&self, now: &ReleaseTrace, key: &Key) -> bool {
+        match self {
+            StoredRelease::Previous(_) => false,
+            StoredRelease::Recorded { trace, key: stored, .. } => trace.reuses(now) && stored == key,
         }
     }
 
@@ -571,14 +585,23 @@ pub fn open_release(bytes: &[u8]) -> Result<StoredRelease<'_>, String> {
         id.copy_from_slice(chunk);
         reads.push(InstanceKey(ContentId(id)));
     }
-    let template = &body[reads_bytes..];
+    if body.len() < reads_bytes + 32 {
+        return Err("a release record whose key does not fit".to_string());
+    }
+    let mut key_bytes = [0; 32];
+    key_bytes.copy_from_slice(&body[reads_bytes..reads_bytes + 32]);
+    let template = &body[reads_bytes + 32..];
     if !template.starts_with(b"BZT7") {
         return Err(
             "a release record whose template is not a template of the previous layout (BZT7)"
                 .to_string(),
         );
     }
-    Ok(StoredRelease::Recorded { trace: ReleaseTrace { reads }, template })
+    Ok(StoredRelease::Recorded {
+        trace: ReleaseTrace { reads },
+        key: Key(ContentId(key_bytes)),
+        template,
+    })
 }
 
 pub const IMPORTED_DOMAIN: &str = "blaze v2 release imported bodies 2";
@@ -4747,7 +4770,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             );
             let from_lookup = out.read(store, &lookup, &job.unit, |it| {
                 let opened = open_release(it)?;
-                if !opened.reuses(&trace) {
+                if !opened.accepts(&trace, &blob_key) {
                     return Ok(None);
                 }
                 stored_function(opened.template(), key, &refs, job.node.described.anchors.as_ref())
@@ -4908,7 +4931,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 By::node(job.name, &job.unit),
                 lookup,
                 Kind::Code,
-                trace.record(&blob::encode(kept)),
+                trace.record(&blob_key, &blob::encode(kept)),
             );
             out.instantiate(
                 &job.unit,

@@ -1675,10 +1675,13 @@ fn a_lookup_reuses_only_the_recorded_reads() {
     let (h, edited) = ([InstanceKey(ContentId([3; 32]))], [InstanceKey(ContentId([4; 32]))]);
     let trace = |built_in: &[InstanceKey]| ReleaseTrace::of(&[], &[g], &[built_in]);
     let template = b"BZT7the-template";
-    let recorded = trace(&h).record(template);
+    let key = Key(ContentId([7; 32]));
+    let other = Key(ContentId([8; 32]));
+    let recorded = trace(&h).record(&key, template);
     let opened = open_release(&recorded).expect("a record");
-    assert!(opened.reuses(&trace(&h)));
-    assert!(!opened.reuses(&trace(&edited)));
+    assert!(opened.accepts(&trace(&h), &key));
+    assert!(!opened.accepts(&trace(&edited), &key));
+    assert!(!opened.accepts(&trace(&h), &other), "the same bodies under another release key");
     assert_eq!(opened.template(), template);
     let previous = open_release(template).expect("the previous layout");
     assert!(!previous.reuses(&trace(&h)));
