@@ -724,27 +724,101 @@ fn split_on<St>(
     }
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
+    let idle = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    // A slow grain's unrun suffix, for a worker that has finished its own.
+    let tails: SegQueue<(usize, usize)> = SegQueue::new();
+    let parked: std::sync::Mutex<Vec<thread::Thread>> = std::sync::Mutex::new(Vec::new());
     // dyn: a panic's payload, as `catch_unwind` gives it
     let panic: Lock<Option<Box<dyn Any + Send>>> = Lock::new("graph.par.split_panic", None);
     let gave: SegQueue<usize> = SegQueue::new();
+    let offer = |from: usize, to: usize| {
+        if from >= to {
+            return;
+        }
+        tails.push((from, to));
+        let mut waiting = parked.lock().unwrap_or_else(|it| it.into_inner());
+        if let Some(worker) = waiting.pop() {
+            worker.unpark();
+        }
+    };
     let claim = || {
         let mut state = None;
-        while !failed.load(Ordering::Relaxed) {
-            let at = next.fetch_add(grain, Ordering::Relaxed);
-            if at >= len {
+        // The tail this worker just offered: leave it for someone else once.
+        let mut yielded = false;
+        loop {
+            if failed.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
                 break;
             }
-            let range = at..(at + grain).min(len);
-            if !again {
-                run(state.get_or_insert_with(&init), range);
+            let at = next.fetch_add(grain, Ordering::Relaxed);
+            if at >= len {
+                let mut waiting = parked.lock().unwrap_or_else(|it| it.into_inner());
+                let skip = yielded;
+                yielded = false;
+                if !skip {
+                    if let Some((from, to)) = tails.pop() {
+                        drop(waiting);
+                        run(state.get_or_insert_with(&init), from..to);
+                        continue;
+                    }
+                }
+                let n = idle.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == jobs && !skip {
+                    if let Some((from, to)) = tails.pop() {
+                        idle.fetch_sub(1, Ordering::Relaxed);
+                        drop(waiting);
+                        run(state.get_or_insert_with(&init), from..to);
+                        continue;
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                    let wake = std::mem::take(&mut *waiting);
+                    drop(waiting);
+                    for worker in wake {
+                        worker.unpark();
+                    }
+                    break;
+                }
+                waiting.push(thread::current());
+                drop(waiting);
+                thread::park();
+                idle.fetch_sub(1, Ordering::Relaxed);
                 continue;
             }
-            for at in range {
+            let end = (at + grain).min(len);
+            if again || end - at <= 1 {
+                let range = at..end;
+                if !again {
+                    run(state.get_or_insert_with(&init), range);
+                    continue;
+                }
+            } else {
+                let mid = at + (end - at) / 2;
+                let began = Instant::now();
+                run(state.get_or_insert_with(&init), at..mid);
+                if began.elapsed().as_nanos() as u64 > SMALL_NS && mid < end {
+                    offer(mid, end);
+                    yielded = true;
+                } else if mid < end {
+                    run(state.get_or_insert_with(&init), mid..end);
+                }
+                continue;
+            }
+            let range = at..end;
+            for at in range.clone() {
                 let before = pump::gave_way();
+                let began = Instant::now();
                 let one = catch_unwind(AssertUnwindSafe(|| {
                     run(state.get_or_insert_with(&init), at..at + 1)
                 }));
-                let Err(it) = one else { continue };
+                let Err(it) = one else {
+                    let rest = at + 1;
+                    if began.elapsed().as_nanos() as u64 > SMALL_NS && rest < range.end {
+                        offer(rest, range.end);
+                        yielded = true;
+                        break;
+                    }
+                    continue;
+                };
                 if pump::gave_way() == before {
                     resume_unwind(it);
                 }
@@ -760,7 +834,12 @@ fn split_on<St>(
     let caught = |ran: thread::Result<()>| {
         if let Err(it) = ran {
             failed.store(true, Ordering::Relaxed);
+            stop.store(true, Ordering::Relaxed);
             panic.lock().get_or_insert(it);
+            let mut waiting = parked.lock().unwrap_or_else(|err| err.into_inner());
+            for worker in waiting.drain(..) {
+                worker.unpark();
+            }
         }
     };
     if jobs <= 1 {
@@ -989,6 +1068,40 @@ mod tests {
     }
 
     const LONG: Duration = Duration::from_secs(60);
+
+    /// A grain whose first half runs long offers the rest: another worker of the pool runs
+    /// that tail, and every item still runs once.
+    #[test]
+    fn a_slow_grain_offers_its_tail() {
+        let pool = Pool::new(&Topology::flat(2), false).unwrap();
+        let (tx, rx) = unbounded::<(Vec<usize>, bool)>();
+        pool.submit(
+            None,
+            move || {
+                let threads = Arc::new(
+                    (0..32).map(|_| AtomicUsize::new(usize::MAX)).collect::<Vec<_>>(),
+                );
+                let offered = Arc::new(AtomicBool::new(false));
+                let mine = std::thread::current().id();
+                crate::par::for_each(0..32, |at| {
+                    if at == 0 {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let id = std::thread::current().id();
+                    threads[at].store(if id == mine { 0 } else { 1 }, Ordering::Relaxed);
+                });
+                let ran: Vec<usize> = threads.iter().map(|it| it.load(Ordering::Relaxed)).collect();
+                let other = ran.iter().any(|it| *it == 1);
+                _ = offered;
+                (ran, other)
+            },
+            move |it| _ = tx.send(it.unwrap()),
+        );
+        let (ran, other) = rx.recv_timeout(LONG).unwrap();
+        assert!(ran.iter().all(|it| *it != usize::MAX), "every item ran");
+        assert_ne!(ran[0], ran[1], "the item after the slow one ran on the other worker");
+        assert!(other, "the other worker ran part of the loop");
+    }
 
     /// Both workers of a pool of two run a job whose parallel map's items each wait on another
     /// job of the same pool: the map's wait and each item's pump the pool, so every job ends.
