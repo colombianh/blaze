@@ -658,7 +658,20 @@ impl<G: Give> Pool<G> {
 
     /// The pages of `run` made the process's before a load writes them.
     fn reuse_run(&self, run: Run) -> Result<(), MemError> {
-        self.give.reuse(self, (run.first * PAGE) as usize, (u64::from(run.pages) * PAGE) as usize)
+        self.give.reuse(self, (run.first * PAGE) as usize, (u64::from(run.pages) * PAGE) as usize)?;
+        // The asker faults the pages before the loader writes them. The reservation is sparse,
+        // so this touch places each physical page on this thread's NUMA node.
+        self.fault(run);
+        Ok(())
+    }
+
+    /// Reads one byte of each page of `run` on this thread so the kernel places the page here.
+    fn fault(&self, run: Run) {
+        for page in run.pages() {
+            let ptr = self.addr(page * PAGE);
+            // SAFETY: `page` is inside the live reservation, mapped readable for its life.
+            unsafe { std::ptr::read_volatile(ptr) };
+        }
     }
 
     /// `ranges` of pages given back; the bytes that went (a prefix of the ranges).

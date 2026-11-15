@@ -1631,6 +1631,18 @@ fn the_sweep_takes_a_page_read_once_and_passes_over_one_read_again() {
     world.check().unwrap_or_else(|broke| panic!("{broke}"));
 }
 
+/// The asker faults a reused page before it returns, so the loader's later write is not
+/// the first touch.
+#[test]
+fn a_reused_page_is_faulted_on_the_asker() {
+    let pool = Pool::new(1, Poison::default()).unwrap();
+    let run = Run { first: 0, pages: 1 };
+    pool.reuse_run(run).unwrap();
+    // SAFETY: the page was just faulted inside the reservation.
+    let byte = unsafe { std::ptr::read_volatile(pool.addr(0)) };
+    assert_eq!(byte, 0);
+}
+
 /// A window freed by one NUMA node is the next open on that node, not the other node's.
 #[test]
 fn a_freed_window_returns_to_the_node_that_opened_it() {
