@@ -653,6 +653,9 @@ impl Inject {
 #[repr(align(128))]
 struct Group {
     inject: Inject,
+    /// Its [`Class::Promote`] jobs: taken after every normal and critical job, before
+    /// [`Group::later`], one at a time, never stolen as other work.
+    soon: Inject,
     /// Its [`Class::Background`] jobs: taken one at a time, by a worker that found nothing
     /// else, never into a deque, so no thief takes one as other work.
     later: Inject,
@@ -841,6 +844,9 @@ pub enum Class {
     /// a wait parks and resumes it as a normal job, so a job that waits for a key it holds
     /// never waits behind the queue.
     Background,
+    /// Tier promotion and speculation: after the request, before upkeep
+    /// ([`Class::Background`]). Taken one at a time, never stolen as other work.
+    Promote,
     Normal,
     /// On its request's critical path ([`Pool::submit_critical`]).
     Critical,
@@ -1052,6 +1058,7 @@ impl Pool {
             .enumerate()
             .map(|(at, workers)| Group {
                 inject: Inject::new(),
+                soon: Inject::new(),
                 later: Inject::new(),
                 fast: workers.iter().any(|&it| topology.cpus[it as usize].fast),
                 order: topology.steal_order(at as u32).into_boxed_slice(),
@@ -2002,7 +2009,7 @@ impl<'env> Scope<'env> {
                     shared.push(near, job);
                 }
             }
-            Class::Critical | Class::Background => shared.push_as(near, class, job),
+            Class::Critical | Class::Promote | Class::Background => shared.push_as(near, class, job),
         }
     }
 }
@@ -2179,6 +2186,11 @@ impl Shared {
         match class {
             Class::Critical => self.push_to(self.place(near, true), job),
             Class::Normal => self.push(near, job),
+            Class::Promote => {
+                let group = self.place(near, false);
+                self.groups[group].soon.push(job);
+                self.announce(group);
+            }
             Class::Background => {
                 let group = self.place(near, false);
                 self.groups[group].later.push(job);
@@ -2198,7 +2210,9 @@ impl Shared {
     }
 
     fn any_work(&self) -> bool {
-        self.groups.iter().any(|it| !it.inject.is_empty() || !it.later.is_empty())
+        self.groups.iter().any(|it| {
+            !it.inject.is_empty() || !it.soon.is_empty() || !it.later.is_empty()
+        })
             || self
                 .slots
                 .iter()
@@ -2382,11 +2396,23 @@ impl Local {
         }
     }
 
+    /// A promotion, nearest group first, once no group has a normal or critical job queued.
+    fn soon(&self) -> Option<Job> {
+        let shared = &*self.shared;
+        if !shared.groups.iter().all(|it| it.inject.is_empty()) {
+            return None;
+        }
+        shared.groups[self.group]
+            .order
+            .iter()
+            .find_map(|&at| shared.groups[at as usize].soon.pop())
+    }
+
     /// A background job, nearest group first, for a worker that found no other while no group
     /// has one queued.
     fn later(&self) -> Option<Job> {
         let shared = &*self.shared;
-        if !shared.groups.iter().all(|it| it.inject.is_empty()) {
+        if !shared.groups.iter().all(|it| it.inject.is_empty() && it.soon.is_empty()) {
             return None;
         }
         shared.groups[self.group]
@@ -2682,6 +2708,12 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
                 ran();
                 continue;
             }
+        }
+        if let Some(job) = local.soon() {
+            search = None;
+            local.run(&mut runner, job);
+            ran();
+            continue;
         }
         if let Some(job) = local.later() {
             search = None;
@@ -4549,6 +4581,35 @@ mod tests {
         assert_eq!(ran, ["first", "second", "background"]);
     }
 
+    /// On a pool of one worker, busy while a promotion and a background job are given: the
+    /// promotion runs first. Both wait until no normal job is queued.
+    #[test]
+    fn a_promotion_runs_before_background() {
+        let pool = Pool::new(&Topology::flat(1), false).unwrap();
+        let (go_tx, go_rx) = bounded::<()>(0);
+        let (tx, rx) = unbounded::<&'static str>();
+        let started = Arc::new(AtomicUsize::new(0));
+        {
+            let started = Arc::clone(&started);
+            pool.submit(
+                None,
+                move || {
+                    started.store(1, Ordering::SeqCst);
+                    go_rx.recv().unwrap();
+                },
+                |it| it.unwrap(),
+            );
+        }
+        until("the worker to be busy", || started.load(Ordering::SeqCst) == 1);
+        for (class, name) in [(Class::Background, "background"), (Class::Promote, "promote")] {
+            let tx = tx.clone();
+            pool.submit_as(None, class, move || name, move |it| _ = tx.send(it.unwrap()));
+        }
+        go_tx.send(()).unwrap();
+        let ran: Vec<_> = (0..2).map(|_| rx.recv_timeout(LONG).unwrap()).collect();
+        assert_eq!(ran, ["promote", "background"]);
+    }
+
     /// A scope's background job, on a pool of one worker that always has a normal job queued
     /// (each gives the next): never taken as background, it runs once the scope's call waits
     /// on it, promoted behind the queued one.
@@ -5467,6 +5528,7 @@ mod model {
             .collect();
         let group = Group {
             inject: Inject::new(),
+            soon: Inject::new(),
             later: Inject::new(),
             workers: (0..workers as u32).collect(),
             order: Topology::flat(workers).steal_order(0).into_boxed_slice(),
