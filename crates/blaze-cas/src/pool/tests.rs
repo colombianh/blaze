@@ -1631,6 +1631,22 @@ fn the_sweep_takes_a_page_read_once_and_passes_over_one_read_again() {
     world.check().unwrap_or_else(|broke| panic!("{broke}"));
 }
 
+/// A window freed by one NUMA node is the next open on that node, not the other node's.
+#[test]
+fn a_freed_window_returns_to_the_node_that_opened_it() {
+    let pool = Pool::new(4, Poison::default()).unwrap();
+    let mut windows = Windows::new(4);
+    let a = windows.open_on(&pool, FileId::Pack(0), 1, Rank::Plain, Some(0)).unwrap();
+    let b = windows.open_on(&pool, FileId::Pack(1), 1, Rank::Plain, Some(1)).unwrap();
+    assert_ne!(a.first, b.first);
+    windows.retire(&pool, FileId::Pack(0)).unwrap();
+    windows.retire(&pool, FileId::Pack(1)).unwrap();
+    let again = windows.open_on(&pool, FileId::Pack(2), 1, Rank::Plain, Some(0)).unwrap();
+    assert_eq!(again.first, a.first, "node 0 takes its own window back");
+    let other = windows.open_on(&pool, FileId::Pack(3), 1, Rank::Plain, Some(1)).unwrap();
+    assert_eq!(other.first, b.first, "node 1 takes its own window back");
+}
+
 /// The loader's thread end to end on a real file system: a file's records pinned through it,
 /// loaded by its driver's reads and checked, every page given back by the kernel (the real
 /// `Region::evict`), and pinned again, loading again.

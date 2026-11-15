@@ -743,7 +743,7 @@ impl Hot {
                     .gate
                     .lock()
                     .windows
-                    .open_room(&*side.pool, id, 0, to, Rank::Plain)
+                    .open_room(&*side.pool, id, 0, to, Rank::Plain, blaze_graph::pool::node())
                     // alloc: the error of a commit that fails
                     .map_err(|err| err.to_string())?;
                 // clone: the loads keep the name for their reads

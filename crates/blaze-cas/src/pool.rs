@@ -929,6 +929,9 @@ pub(crate) struct Windows {
     total: u32,
     /// Pages of every open file's committed bytes.
     open_pages: u64,
+    /// The NUMA node that first opened each window, kept after it is freed so the next open
+    /// on that node takes it back. `None` until a worker with a node opens it.
+    homes: Vec<Option<u32>>,
 }
 
 impl Windows {
@@ -940,6 +943,7 @@ impl Windows {
             next: 0,
             total,
             open_pages: 0,
+            homes: Vec::new(),
         }
     }
 
@@ -977,7 +981,20 @@ impl Windows {
     ///
     /// [`PoolError::Full`] when the reservation has no run of windows that long left.
     pub(crate) fn open<G: Give>(&mut self, pool: &Pool<G>, id: FileId, len: u64, rank: Rank) -> Result<Window, PoolError> {
-        self.open_room(pool, id, len, len, rank)
+        self.open_on(pool, id, len, rank, blaze_graph::pool::node())
+    }
+
+    /// [`Windows::open`] for a worker on NUMA node `home` (`None` for a thread of no pool).
+    /// A freed window goes back to the node that opened it.
+    pub(crate) fn open_on<G: Give>(
+        &mut self,
+        pool: &Pool<G>,
+        id: FileId,
+        len: u64,
+        rank: Rank,
+        home: Option<u32>,
+    ) -> Result<Window, PoolError> {
+        self.open_room(pool, id, len, len, rank, home)
     }
 
     /// As [`Windows::open`], with windows for `room` bytes (at least `len`): a file a commit is
@@ -994,10 +1011,23 @@ impl Windows {
         len: u64,
         room: u64,
         rank: Rank,
+        home: Option<u32>,
     ) -> Result<Window, PoolError> {
         assert!(!self.ids.contains_key(&id), "{id:?} opened in the store's pool twice");
         let count = (room.max(len).div_ceil(WINDOW).max(1)) as u32;
-        let free = self.free.iter().copied().find(|&first| (first..first + count).all(|it| self.free.contains(&it)));
+        let run_free = |free: &BTreeSet<u32>, first: u32| {
+            (first..first + count).all(|it| free.contains(&it))
+        };
+        let same = home.and_then(|node| {
+            self.free.iter().copied().find(|&first| {
+                run_free(&self.free, first) && self.home_of(first, count) == Some(node)
+            })
+        });
+        let untouched = home.and_then(|_| {
+            self.free.iter().copied().find(|&first| run_free(&self.free, first) && self.home_of(first, count).is_none())
+        });
+        let any = self.free.iter().copied().find(|&first| run_free(&self.free, first));
+        let free = if home.is_some() { same.or(untouched).or(any) } else { any };
         let first = match free {
             Some(first) => {
                 for it in first..first + count {
@@ -1024,7 +1054,37 @@ impl Windows {
         self.by_first.insert(first, window);
         self.ids.insert(id, first);
         self.open_pages += window.pages();
+        self.note(first, count, home);
         Ok(window)
+    }
+
+    /// The node that opened every window of `first..first+count`, if they are one node.
+    fn home_of(&self, first: u32, count: u32) -> Option<u32> {
+        let mut home = None;
+        for it in first..first + count {
+            let this = self.homes.get(it as usize).copied().flatten();
+            match (home, this) {
+                (_, None) => return None,
+                (None, Some(node)) => home = Some(node),
+                (Some(had), Some(node)) if had != node => return None,
+                _ => {}
+            }
+        }
+        home
+    }
+
+    /// Remember `home` for windows that have none yet. A window another node opened keeps that node.
+    fn note(&mut self, first: u32, count: u32, home: Option<u32>) {
+        let end = (first + count) as usize;
+        if self.homes.len() < end {
+            self.homes.resize(end, None);
+        }
+        let Some(node) = home else { return };
+        for it in first..first + count {
+            if self.homes[it as usize].is_none() {
+                self.homes[it as usize] = Some(node);
+            }
+        }
     }
 
     /// `id`'s committed bytes grown to `len` by a commit ([`Append::commit`]), inside its
