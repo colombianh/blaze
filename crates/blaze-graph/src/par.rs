@@ -52,6 +52,24 @@ use crate::{
 /// leaves the rest to the others, few enough that claiming one stays far below its work.
 const RANGES: usize = 8;
 
+/// How many items one claim covers. With no prediction (`item_ns` 0) that is
+/// `len / (threads * RANGES)`, at least one. With a prediction it is the number that
+/// fills a few milliseconds ([`SMALL_NS`]), and no more than one share of the items
+/// per worker, so a machine with many cores still has a batch each.
+pub(crate) fn grain_for(len: usize, threads: usize, item_ns: u64) -> usize {
+    if len == 0 {
+        return 1;
+    }
+    let threads = threads.max(1);
+    let by_count = len.div_ceil(threads * RANGES).max(1);
+    if item_ns == 0 {
+        return by_count;
+    }
+    let by_cost = usize::try_from(SMALL_NS / item_ns).unwrap_or(usize::MAX).max(1);
+    let share = len.div_ceil(threads).max(1);
+    by_cost.min(share).max(1)
+}
+
 /// Items a loop hands out by index, from any of its threads at once.
 ///
 /// # Safety
@@ -618,7 +636,12 @@ impl Small {
     /// What a run of `count` items is predicted to cost, in nanoseconds: 0 with no small run
     /// measured yet.
     pub fn predicted_ns(&self, count: usize) -> u64 {
-        self.item_ns.load(Ordering::Relaxed).saturating_mul(count as u64)
+        self.item_ns().saturating_mul(count as u64)
+    }
+
+    /// The predicted cost of one item, in nanoseconds; 0 when this site has not run yet.
+    pub fn item_ns(&self) -> u64 {
+        self.item_ns.load(Ordering::Relaxed)
     }
 
     /// Whether a run of `count` items runs on its calling thread.
@@ -663,7 +686,7 @@ where
     let mut out: Vec<R> = Vec::with_capacity(len);
     let to = Out(out.as_mut_ptr());
     let threads = if here { 1 } else { pool::threads_here() };
-    split_on(threads, len, <I::Source as Source>::AGAIN, || (), |(), range| {
+    split_on(threads, len, <I::Source as Source>::AGAIN, small.item_ns(), || (), |(), range| {
         for at in range {
             // SAFETY: as in `for_each`.
             let made = f(unsafe { items.item(at) });
@@ -700,7 +723,7 @@ fn split<St>(
     if len == 0 {
         return;
     }
-    split_on(pool::threads_here(), len, again, init, run);
+    split_on(pool::threads_here(), len, again, 0, init, run);
 }
 
 /// [`split`] across at most `threads` threads, this one among them: with 1, every range is
@@ -709,6 +732,7 @@ fn split_on<St>(
     threads: usize,
     len: usize,
     again: bool,
+    item_ns: u64,
     init: impl Fn() -> St + Sync,
     run: impl Fn(&mut St, Range<usize>) + Sync,
 ) {
@@ -716,7 +740,7 @@ fn split_on<St>(
         return;
     }
     let threads = threads.max(1);
-    let grain = len.div_ceil(threads * RANGES).max(1);
+    let grain = grain_for(len, threads, item_ns);
     let jobs = len.div_ceil(grain).min(threads);
     if jobs <= 1 && !again {
         run(&mut init(), 0..len);
@@ -1068,6 +1092,16 @@ mod tests {
     }
 
     const LONG: Duration = Duration::from_secs(60);
+
+    /// A batch with no prediction keeps the count split. One whose items already fill a few
+    /// milliseconds is a single item, and a cheap item does not take more than one worker's share.
+    #[test]
+    fn a_predicted_batch_aims_at_a_few_milliseconds() {
+        assert_eq!(super::grain_for(32, 2, 0), 2);
+        assert_eq!(super::grain_for(10_000, 4, super::SMALL_NS), 1);
+        assert_eq!(super::grain_for(10_000, 4, super::SMALL_NS / 4), 4);
+        assert_eq!(super::grain_for(8, 2, 1), 4);
+    }
 
     /// A grain whose first half runs long offers the rest: another worker of the pool runs
     /// that tail, and every item still runs once.
