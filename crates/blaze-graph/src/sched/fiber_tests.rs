@@ -188,7 +188,10 @@ impl Work for &'static CrossedDrivers {
         while self.claimed.load(Ordering::Acquire) < 2 {
             cx.wait(Wait::Until(cx.now() + 100_000)).expect("a timed wait closes no cycle");
         }
-        if let Err(cycle) = cx.wait(Wait::Key(key(100 + (1 - mine)))) {
+        if let Err(failure) = cx.wait(Wait::Key(key(100 + (1 - mine)))) {
+            let WaitFail::Cycle(cycle) = failure else {
+                panic!("the wait was superseded, and nothing superseded it");
+            };
             self.refused.lock().push(cycle);
         }
         cx.key_done(key(100 + mine));
@@ -347,7 +350,10 @@ impl Work for &'static Pair {
             until("the first job's handle", || self.first.get().is_some());
             *self.first.get().unwrap()
         };
-        if let Err(cycle) = cx.wait_job(other) {
+        if let Err(failure) = cx.wait_job(other) {
+            let WaitFail::Cycle(cycle) = failure else {
+                panic!("the wait was superseded, and nothing superseded it");
+            };
             self.refused.lock().push(cycle);
         }
     }

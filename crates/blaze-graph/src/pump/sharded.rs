@@ -12,7 +12,7 @@ use std::{
 use super::{Lock, claim_flight, flight, give_way, hex, task};
 use crate::{
     Cancelled, Key,
-    sched::{self, CounterId, Wait},
+    sched::{self, CounterId, Wait, WaitFail},
 };
 
 type ByKey<V> = blaze_hash::ByHash<Key, V, std::alloc::Global>; // alloc: a shard's table, for the pump's life
@@ -116,8 +116,12 @@ impl<V: Clone + Send + Sync + 'static> Sharded<V> {
                 entry.flight
             };
             if waiter.state.load(Ordering::Acquire) == RUNNING
-                && let Err(cycle) = sched::wait(Wait::Key(flight(number)))
+                && let Err(failure) = sched::wait(Wait::Key(flight(number)))
             {
+                let WaitFail::Cycle(cycle) = failure else {
+                    self.unlink(&key, &waiter);
+                    return Err(give_way());
+                };
                 // alloc: a give-way's record, rare
                 sched::gave_way_on(key, hex(&key).into_boxed_str(), flight(number), &cycle);
                 self.unlink(&key, &waiter);

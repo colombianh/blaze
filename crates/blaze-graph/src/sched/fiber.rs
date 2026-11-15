@@ -46,7 +46,7 @@ use std::{
 use blaze_core::lock::LockGuard;
 
 use super::{
-    CoreId, Cores, CounterId, Cycle, JobId, OWN, Spawn, Stats, Suspend, Wait, World, Yielded,
+    CoreId, Cores, CounterId, Cycle, JobId, OWN, Spawn, Stats, Suspend, Wait, WaitFail, World, Yielded,
     domain::{Domain, Guard, Scheduler, lock_joined, wait_cell},
     stack::{FIBER_STACK, Resumed, Stack, Stackful, Yielder},
 };
@@ -131,6 +131,8 @@ enum In<J> {
 pub(super) enum Answer {
     Ready,
     Cycle(Cycle),
+    /// The job was superseded and did not park.
+    Stale,
     /// A carried thread-local's take or put panicked as the job switched: the job unwinds
     /// with that panic where it waited, its own failure.
     Raise(Panic),
@@ -480,7 +482,7 @@ impl<W: Work> Cx<'_, W> {
     /// # Errors
     ///
     /// The cycle the wait would close; the children run on regardless.
-    pub fn map(&self, jobs: impl IntoIterator<Item = W::Job>, how: Spawn) -> Result<(), Cycle> {
+    pub fn map(&self, jobs: impl IntoIterator<Item = W::Job>, how: Spawn) -> Result<(), WaitFail> {
         let counter = self.counter();
         for job in jobs {
             self.spawn(job, how.counted(counter));
@@ -519,7 +521,7 @@ impl<W: Work> Cx<'_, W> {
     ///
     /// For `Wait::Job` (use [`Cx::wait_job`]: a bare id may be recycled), or inside a
     /// [`NoWait`].
-    pub fn wait(&self, on: Wait) -> Result<(), Cycle> {
+    pub fn wait(&self, on: Wait) -> Result<(), WaitFail> {
         assert!(
             !matches!(on, Wait::Job(_)),
             "job {} waits for a bare job id: wait for its `Handle`",
@@ -533,7 +535,7 @@ impl<W: Work> Cx<'_, W> {
     /// # Errors
     ///
     /// The cycle the wait would close; nothing waited.
-    pub fn wait_job(&self, job: Handle) -> Result<(), Cycle> {
+    pub fn wait_job(&self, job: Handle) -> Result<(), WaitFail> {
         self.switch(Out::Wait(Want::Job(job)))
     }
 
@@ -548,7 +550,7 @@ impl<W: Work> Cx<'_, W> {
     }
 
     #[inline(never)]
-    fn switch(&self, out: Out) -> Result<(), Cycle> {
+    fn switch(&self, out: Out) -> Result<(), WaitFail> {
         check_no_wait(self.job);
         let here = HERE.get();
         assert!(
@@ -561,7 +563,8 @@ impl<W: Work> Cx<'_, W> {
         enter(self);
         match back {
             In::Go(Answer::Ready) => Ok(()),
-            In::Go(Answer::Cycle(cycle)) => Err(cycle),
+            In::Go(Answer::Cycle(cycle)) => Err(WaitFail::Cycle(cycle)),
+            In::Go(Answer::Stale) => Err(WaitFail::Stale),
             In::Go(Answer::Raise(panic)) => panic::resume_unwind(panic),
             In::Start(..) | In::Exit => unreachable!("a suspended job is only resumed"),
         }
@@ -585,7 +588,7 @@ pub(super) struct Here {
     /// [`UNREGISTERED`] for a job of a pool's until it first joins the wait graph.
     pub(super) job: JobId,
     pub(super) register: unsafe fn(*const ()) -> JobId,
-    pub(super) wait: unsafe fn(*const (), Wait) -> Result<(), Cycle>,
+    pub(super) wait: unsafe fn(*const (), Wait) -> Result<(), WaitFail>,
     pub(super) relocate: unsafe fn(*const ()),
     pub(super) claim: unsafe fn(*const (), Key) -> bool,
     pub(super) key_done: unsafe fn(*const (), Key),
@@ -604,7 +607,7 @@ thread_local! {
 }
 
 #[allow(unsafe_code)]
-unsafe fn wait_thunk<W: Work>(cx: *const (), on: Wait) -> Result<(), Cycle> {
+unsafe fn wait_thunk<W: Work>(cx: *const (), on: Wait) -> Result<(), WaitFail> {
     // SAFETY: `cx` is the `Cx<W>` `enter` stored, on the running fiber's stack; it is read
     // only by code running on that fiber, while it is on this thread (`clear` runs as soon as
     // the fiber switches out).
@@ -1548,6 +1551,7 @@ fn run<'a, W: Work>(
                 match on.map(|on| st.world().suspended(member, job, on)) {
                     None | Some(Ok(Suspend::Ready)) => In::Go(Answer::Ready),
                     Some(Err(cycle)) => In::Go(Answer::Cycle(cycle)),
+                    Some(Ok(Suspend::Stale)) => In::Go(Answer::Stale),
                     Some(Ok(Suspend::Waiting)) => {
                         switched(SwitchEvent::Parked(on), job, fiber.1, me);
                         st.slots[j] = park_carried(&mut st, fiber, &mut worker);

@@ -277,6 +277,9 @@ impl Sim {
                 assert!(!closes, "job {job}'s wait {wait:?} closes a cycle");
                 self.waits.insert(job, wait);
             }
+            Ok(Suspend::Stale) => {
+                panic!("job {job} was superseded, and this model never supersedes a job")
+            }
             Err(cycle) => {
                 assert!(
                     closes,
@@ -673,6 +676,17 @@ fn all_busy(sched: &mut Sched) {
         sched.core_idle(CoreId(core));
         assert_eq!(decisions(sched), [run(core, core)]);
     }
+    sched.audit();
+}
+
+#[test]
+fn a_superseded_job_does_not_park_at_its_next_wait() {
+    let mut sched = Sched::new(Cores::flat(1).unwrap(), 4);
+    all_busy(&mut sched);
+    sched.supersede(JobId(0));
+    assert_eq!(sched.suspended(JobId(0), Wait::Until(1_000_000)), Ok(Suspend::Stale));
+    assert!(decisions(&mut sched).is_empty(), "a stale job does not leave its core");
+    sched.done(JobId(0));
     sched.audit();
 }
 

@@ -33,7 +33,7 @@ use std::{
 };
 
 use super::{
-    CounterId, Cycle, JobId, Suspend, Wait,
+    CounterId, Cycle, JobId, Suspend, Wait, WaitFail,
     domain::{
         Domain, Guard, Scheduler, counter_cell, key_cell, live_job_cell, lock, lock_joined, roots,
         wait_cell,
@@ -631,6 +631,7 @@ impl<'a> Host<'a> {
                     }
                     input = match suspended {
                         Ok(Suspend::Ready) => In::Go(Answer::Ready),
+                        Ok(Suspend::Stale) => In::Go(Answer::Stale),
                         Err(cycle) => In::Go(Answer::Cycle(cycle)),
                         Ok(Suspend::Waiting) => {
                             switched(SwitchEvent::Parked(Some(on)), job, fiber.1, core());
@@ -815,7 +816,7 @@ unsafe fn register_thunk(cx: *const ()) -> JobId {
 }
 
 #[allow(unsafe_code)]
-unsafe fn wait_thunk(cx: *const (), on: Wait) -> Result<(), Cycle> {
+unsafe fn wait_thunk(cx: *const (), on: Wait) -> Result<(), WaitFail> {
     // SAFETY: as in `register_thunk`.
     let cx = unsafe { host_cx(cx) };
     assert!(
@@ -832,7 +833,8 @@ unsafe fn wait_thunk(cx: *const (), on: Wait) -> Result<(), Cycle> {
             fail_if_stalled(cx.sched, job);
             Ok(())
         }
-        In::Go(Answer::Cycle(cycle)) => Err(cycle),
+        In::Go(Answer::Cycle(cycle)) => Err(WaitFail::Cycle(cycle)),
+        In::Go(Answer::Stale) => Err(WaitFail::Stale),
         In::Go(Answer::Raise(panic)) => panic::resume_unwind(panic),
         In::Start(_) | In::Exit => unreachable!("a parked job is only resumed"),
     }
@@ -959,7 +961,7 @@ fn client_job() -> JobId {
 }
 
 #[inline(never)]
-fn client_wait(on: Wait) -> Result<(), Cycle> {
+fn client_wait(on: Wait) -> Result<(), WaitFail> {
     assert!(
         !matches!(on, Wait::Job(_) | Wait::Until(_)),
         "a thread on no fiber waits for a key or a counter"
@@ -970,8 +972,11 @@ fn client_wait(on: Wait) -> Result<(), Cycle> {
             let mut g = lock_joined(client.sched().cell(), || wait_cell(on));
             let job = client.register(&mut g);
             client.woken.store(false, Ordering::Relaxed);
-            if g.world.suspended(client.member.get(), job, on)? == Suspend::Ready {
-                return Ok(());
+            match g.world.suspended(client.member.get(), job, on) {
+                Ok(Suspend::Ready) => return Ok(()),
+                Ok(Suspend::Stale) => return Err(WaitFail::Stale),
+                Ok(Suspend::Waiting) => {}
+                Err(cycle) => return Err(WaitFail::Cycle(cycle)),
             }
             job
         };
@@ -996,7 +1001,7 @@ pub fn job_here() -> JobId {
 /// The cycle the wait would close; nothing waited.
 #[inline(never)]
 #[allow(unsafe_code)]
-pub fn wait(on: Wait) -> Result<(), Cycle> {
+pub fn wait(on: Wait) -> Result<(), WaitFail> {
     match HERE.get() {
         // SAFETY: `here` was stored by the fiber running this code, on this thread.
         Some(here) => unsafe { (here.wait)(here.cx, on) },
@@ -1180,7 +1185,7 @@ impl EventWait {
     /// # Errors
     ///
     /// The cycle the wait would close; nothing waited.
-    pub fn wait(self) -> Result<(), Cycle> {
+    pub fn wait(self) -> Result<(), WaitFail> {
         wait(Wait::Key(self.0))
     }
 }

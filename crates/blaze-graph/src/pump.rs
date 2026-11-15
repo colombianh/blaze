@@ -24,7 +24,7 @@ use std::cell::Cell;
 
 use crate::{
     Cancelled, Key,
-    sched::{self, CounterId, JobId, Wait},
+    sched::{self, CounterId, JobId, Wait, WaitFail},
     sync::{
         LockGuard,
         atomic::{AtomicU64, Ordering},
@@ -511,8 +511,11 @@ fn wait<V>(
     named: &mut impl FnMut(&mut String),
 ) -> Result<Option<V>, Cancelled> {
     if waiter.is_running()
-        && let Err(cycle) = sched::wait(Wait::Key(flight))
+        && let Err(failure) = sched::wait(Wait::Key(flight))
     {
+        let WaitFail::Cycle(cycle) = failure else {
+            return Err(give_way());
+        };
         // alloc: a give-way's record, rare: what the caller names the key, for the bound's error
         let mut asked = String::new();
         named(&mut asked);

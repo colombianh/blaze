@@ -120,6 +120,8 @@ struct Own {
     free: Vec<u32>,
     /// The tokens of jobs woken since its member last took them.
     woken: Vec<usize>,
+    /// Parallel to `state`: the job was superseded and must not park.
+    stale: Vec<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -294,6 +296,17 @@ pub enum Suspend {
     Waiting,
     /// What it waits for is done already: the job goes on, on its core.
     Ready,
+    /// The job was superseded. It did not park. What it has done must not be published.
+    Stale,
+}
+
+/// Why [`crate::sched::wait`] did not park.
+#[derive(Clone, Debug)]
+pub enum WaitFail {
+    /// The wait would close a cycle. Nothing waited.
+    Cycle(Cycle),
+    /// [`Sched::supersede`] ran. The job did not park, and its partial work must not be published.
+    Stale,
 }
 
 /// What [`Sched::yielded`] did.
@@ -523,6 +536,8 @@ struct Job {
     band: u8,
     /// Suspended on a timed wait, which the placement keeps; any other wait is the graph's.
     timed: bool,
+    /// Its inputs changed ([`Sched::supersede`]). The next wait does not park.
+    stale: bool,
     /// Queued: the core that holds it; running: its core; suspended or done: where it last ran.
     core: u32,
     /// Its id in the [`World`].
@@ -544,7 +559,7 @@ impl Job {
 const _: () = assert!(size_of::<Job>() <= 16);
 
 const VACANT: Job =
-    Job { state: JobState::Vacant, band: Spawn::REQUEST, timed: false, core: NONE, global: NONE };
+    Job { state: JobState::Vacant, band: Spawn::REQUEST, timed: false, stale: false, core: NONE, global: NONE };
 
 /// One driver's cores, queues and clock: where its jobs run. Its job ids are its own.
 pub(crate) struct Place {
@@ -757,7 +772,7 @@ impl Place {
             Affinity::Any => self.least_loaded(critical, |_, _| true),
         };
         self.jobs[j] =
-            Job { state: JobState::Queued, band, timed: false, core: home, global: global.0 };
+            Job { state: JobState::Queued, band, timed: false, stale: false, core: home, global: global.0 };
         self.slack[j] = slack;
         if spawner == Some(home) {
             self.enqueue(home, job);
@@ -1825,6 +1840,26 @@ impl World {
         self.recycle();
     }
 
+    fn is_stale(&self, member: u32, local: u32) -> bool {
+        if member & OWN != 0 {
+            return find(&self.own, member).is_some_and(|own| own.stale.get(local as usize) == Some(&true));
+        }
+        find(&self.members, member).is_some_and(|place| {
+            place.jobs.get(local as usize).is_some_and(|job| job.stale)
+        })
+    }
+
+    /// `job` is live. Its next wait does not park.
+    pub(crate) fn supersede(&mut self, job: JobId) {
+        let (member, local) = self.home(job);
+        assert!(member != NONE, "job {} superseded while not live", job.0);
+        if member & OWN != 0 {
+            self.own_mut(member).stale[local as usize] = true;
+        } else if let Some(place) = find_mut(&mut self.members, member) {
+            place.jobs[local as usize].stale = true;
+        }
+    }
+
     fn assert_running(&self, job: JobId, what: &str) -> (u32, u32) {
         let (member, local) = self.home(job);
         let running = member != NONE && self.is_running(member, local);
@@ -1860,6 +1895,7 @@ impl World {
                 token: Vec::with_capacity(room),
                 free: Vec::with_capacity(room),
                 woken: Vec::with_capacity(room),
+                stale: Vec::with_capacity(room),
             },
         ));
         member
@@ -1896,11 +1932,13 @@ impl World {
             None => {
                 own.state.push(OwnState::Free);
                 own.token.push(0);
+                own.stale.push(false);
                 (own.state.len() - 1) as u32
             }
         };
         own.state[local as usize] = OwnState::Running;
         own.token[local as usize] = token;
+        own.stale[local as usize] = false;
         let job = self.alloc();
         self.graph.add(job, Home { member, local }, counter);
         job
@@ -1999,6 +2037,9 @@ impl World {
     ) -> Result<Suspend, Cycle> {
         let (home, local) = self.assert_running(job, "suspended");
         assert_eq!(home, member, "job {} suspended on a member not its own", job.0);
+        if self.is_stale(home, local) {
+            return Ok(Suspend::Stale);
+        }
         if member & OWN != 0 {
             let on = match on {
                 Wait::Until(at) => {
@@ -2405,6 +2446,16 @@ impl Sched {
     /// Where `job` is not running, or waits for a job never spawned or a counter not live.
     pub fn suspended(&mut self, job: JobId, on: Wait) -> Result<Suspend, Cycle> {
         self.world.suspended(0, job, on)
+    }
+
+    /// `job`, running, had its inputs change. Its next [`Sched::suspended`] does not park,
+    /// and what it has done must not be published.
+    ///
+    /// # Panics
+    ///
+    /// Where `job` is not live.
+    pub fn supersede(&mut self, job: JobId) {
+        self.world.supersede(job);
     }
 
     /// `job`, running, ended, and with it every key it claimed. Its waiters and theirs, and
