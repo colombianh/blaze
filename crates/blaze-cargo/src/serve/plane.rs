@@ -369,6 +369,9 @@ fn run_measured<W: Work>(
     .open();
     let start = Instant::now();
     let (result, spent) = admission::run_as(kind, || {
+        if granted > 0 {
+            arena::set_grant(arena::current(), granted);
+        }
         if let Some(began) = began {
             // The account `run_as` opened: what this task's work is charged to, read by the
             // loop as it runs. The loop holds the receiver for its life, so a send fails only

@@ -66,6 +66,10 @@ struct Local {
     /// each in all (never netted): charged with `charged`.
     charged_allocated: Cell<u64>,
     charged_freed: Cell<u64>,
+    /// The account's grant, copied from its slot when the thread takes the account
+    /// ([`set_grant`]). 0 is no grant: charges stay batched. A grant makes each growth
+    /// charge at once, so a peak past the grant is on the account as the bytes are taken.
+    grant: Cell<u64>,
     /// What `net` moved since it was last added to [`HELD`].
     unflushed: Cell<i64>,
     /// How far `unflushed` may go before it is added: 0 until the flush at the thread's exit is
@@ -113,6 +117,7 @@ thread_local! {
             charged: Cell::new(0),
             charged_allocated: Cell::new(0),
             charged_freed: Cell::new(0),
+            grant: Cell::new(0),
             unflushed: Cell::new(0),
             batch: Cell::new(0),
             armed: Cell::new(false),
@@ -235,7 +240,10 @@ fn count(holder: Option<Tag>, delta: i64, ptr: *mut u8) {
                 false => local.charged_freed.set(local.charged_freed.get() + delta.unsigned_abs()),
             }
             let charged = local.charged.get().wrapping_add(delta);
-            if charged.unsigned_abs() < ACCOUNT_BATCH.unsigned_abs() {
+            // A granted account charges on this growth. An ungranted one waits for
+            // [`ACCOUNT_BATCH`], so the fast path stays a thread-local add.
+            let gated = local.grant.get() > 0 && delta > 0;
+            if !gated && charged.unsigned_abs() < ACCOUNT_BATCH.unsigned_abs() {
                 local.charged.set(charged);
             } else {
                 charge(local, account, charged);
@@ -721,6 +729,8 @@ struct Slot {
     /// What its work allocated, and what it freed, in all, never netted: its churn.
     allocated: AtomicU64,
     freed: AtomicU64,
+    /// What admission granted this account. 0 is no grant: the slow path stays batched.
+    grant: AtomicU64,
 }
 
 /// Every account's slot, in segments that double, each made the first time an index in it is
@@ -898,6 +908,8 @@ fn switch(account: Account) -> Account {
         if !moved.is_empty() {
             charge_to(was, moved);
         }
+        let grant = account.slot().map_or(0, |slot| slot.grant.load(Ordering::Relaxed));
+        local.grant.set(grant);
         was
     })
 }
@@ -929,6 +941,7 @@ fn open(parent: Account) -> Account {
     slot.peak.store(0, Ordering::Relaxed);
     slot.allocated.store(0, Ordering::Relaxed);
     slot.freed.store(0, Ordering::Relaxed);
+    slot.grant.store(0, Ordering::Relaxed);
     slot.depth.store(depth, Ordering::Relaxed);
     slot.parent.store(parent.0, Ordering::Relaxed);
     // The slot is this open's alone (popped or new): even to odd, published with its fields.
@@ -974,6 +987,31 @@ pub struct Spent {
 pub fn peak_now(account: Account) -> Option<u64> {
     let slot = account.slot()?;
     Some(u64::try_from(slot.peak.load(Ordering::Relaxed)).unwrap_or(0))
+}
+
+/// The bytes `account` may hold before a further growth is past its grant. 0 is no grant:
+/// charges stay batched ([`ACCOUNT_BATCH`]). Called on the thread that charges `account`,
+/// so the next growth on that thread takes the slow path.
+pub fn set_grant(account: Account, grant: u64) {
+    let Some(slot) = account.slot() else { return };
+    slot.grant.store(grant, Ordering::Relaxed);
+    with_local(|local| {
+        if local.account.get() == account.0 {
+            local.grant.set(grant);
+            let charged = local.charged.get();
+            if grant > 0 && charged > 0 {
+                charge(local, account.0, charged);
+            }
+        }
+    });
+}
+
+/// Whether `account`'s charged peak is past the grant [`set_grant`] gave it. False when it
+/// has no grant, or it has closed.
+pub fn over_grant(account: Account) -> bool {
+    let Some(slot) = account.slot() else { return false };
+    let grant = slot.grant.load(Ordering::Relaxed);
+    grant > 0 && u64::try_from(slot.peak.load(Ordering::Relaxed)).unwrap_or(0) > grant
 }
 
 /// Runs `f` in a new account, inside the job's account if it has one, and says the most bytes
@@ -1624,6 +1662,32 @@ mod tests {
     use blaze_ids::rng::SplitMix64;
 
     use super::*;
+
+    #[test]
+    fn a_granted_account_is_over_as_the_charge_passes_its_grant() {
+        let id = account(|| {
+            let id = current();
+            set_grant(id, 1);
+            let mut held = Vec::<u8>::new();
+            held.resize(64, 1);
+            assert!(over_grant(id), "the account whose charge passed its grant");
+            drop(held);
+            id
+        })
+        .0;
+        assert!(!over_grant(id), "a closed account is not over");
+    }
+
+    #[test]
+    fn an_ungranted_account_is_not_over_its_grant() {
+        account(|| {
+            let id = current();
+            let mut held = Vec::<u8>::new();
+            held.resize(64, 1);
+            assert!(!over_grant(id));
+            drop(held);
+        });
+    }
 
     /// `blaze_alloc_count`'s counter under this crate's own: the allocation-budget tests count
     /// calls, the arena's tests bytes held.
