@@ -43,6 +43,14 @@ pub mod keys {
         key("blaze v2 store release template 2", &[blob])
     }
 
+    /// An optimized compile looked up before its reads are known: the function's instance and
+    /// the toolchain. The bodies it read are the record's trace, checked when the record is
+    /// opened ([`crate::driver::ReleaseTrace`]), so two traces of one function are one key and
+    /// a different trace is a miss. A different toolchain is a different compile.
+    pub fn release_lookup(instance: &ContentId, toolchain: &ContentId) -> Key {
+        key("blaze v2 release lookup 1", &[instance, toolchain])
+    }
+
     /// 2: the value is [`crate::summary::Summary::encode`]'s bytes, not JSON, so no JSON
     /// summary is found under a key of now.
     pub fn summary(instance: &InstanceKey) -> Key {
@@ -74,6 +82,24 @@ pub mod keys {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_release_lookup_is_the_function_and_the_toolchain() {
+            let function = ContentId([1; 32]);
+            let toolchain = ContentId([2; 32]);
+            assert_eq!(
+                release_lookup(&function, &toolchain),
+                release_lookup(&function, &toolchain)
+            );
+            assert_ne!(
+                release_lookup(&function, &toolchain),
+                release_lookup(&function, &ContentId([3; 32]))
+            );
+            assert_ne!(
+                release_lookup(&function, &toolchain),
+                release_lookup(&ContentId([4; 32]), &toolchain)
+            );
+        }
 
         #[test]
         fn one_id_is_another_key_in_each_kind() {
