@@ -1658,37 +1658,6 @@ fn an_edited_body_an_import_builds_in_does_not_reuse() {
     assert!(!trace(&h).reuses(&trace(&[])));
 }
 
-/// The lookup key is the function and the toolchain. An edit of a body an import builds in
-/// does not move it. The record reuses only the same reads, and a template of the previous
-/// layout (no trace) is not reused through that key.
-#[test]
-fn a_lookup_reuses_only_the_recorded_reads() {
-    let instance = Instance {
-        code: CodeHash(ContentId([1; 32])),
-        args: ContentId::default(),
-        settings: crate::Settings(ContentId::default()),
-    };
-    let toolchain = ContentId([9; 32]);
-    let lookup = crate::query::keys::release_lookup(&instance.key().0, &toolchain);
-    assert_eq!(lookup, crate::query::keys::release_lookup(&instance.key().0, &toolchain));
-    let g = InstanceKey(ContentId([2; 32]));
-    let (h, edited) = ([InstanceKey(ContentId([3; 32]))], [InstanceKey(ContentId([4; 32]))]);
-    let trace = |built_in: &[InstanceKey]| ReleaseTrace::of(&[], &[g], &[built_in]);
-    let template = b"BZT7the-template";
-    let key = Key(ContentId([7; 32]));
-    let other = Key(ContentId([8; 32]));
-    let recorded = trace(&h).record(&key, template);
-    let opened = open_release(&recorded).expect("a record");
-    assert!(opened.accepts(&trace(&h), &key));
-    assert!(!opened.accepts(&trace(&edited), &key));
-    assert!(!opened.accepts(&trace(&h), &other), "the same bodies under another release key");
-    assert_eq!(opened.template(), template);
-    let previous = open_release(template).expect("the previous layout");
-    assert!(!previous.reuses(&trace(&h)));
-    assert_eq!(previous.template(), template);
-    assert!(open_release(&recorded[..6]).is_err());
-}
-
 /// A release compile's key covers each import's unit as its export is built: in a live
 /// build's tier-up the import is named by its first tier's key, while its export is built at
 /// the next tier's settings (another opt level), so a key of the name alone would keep `f`'s

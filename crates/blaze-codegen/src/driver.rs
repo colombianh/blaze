@@ -492,116 +492,6 @@ impl ReleaseTrace {
     pub fn reuses(&self, now: &ReleaseTrace) -> bool {
         self.reads == now.reads
     }
-
-    /// The store record: this trace, then `template` (a [`crate::blob::encode`] blob).
-    /// `// alloc: the record, one per optimized compile kept`
-    /// The store record: this trace, the release key those reads produced, then `template`.
-    /// The key covers every input of the compile the body list does not (its references and
-    /// their kinds). A later compile reuses the record only when both match.
-    pub fn record(&self, key: &Key, template: &[u8]) -> Vec<u8> {
-        // alloc: the record, one per optimized compile kept
-        let mut out = Vec::with_capacity(4 + 8 + self.reads.len() * 32 + 32 + template.len());
-        out.extend_from_slice(&RELEASE_RECORD);
-        out.extend_from_slice(&(self.reads.len() as u64).to_le_bytes());
-        for read in &self.reads {
-            out.extend_from_slice(&read.0.0);
-        }
-        out.extend_from_slice(&key.0.0);
-        out.extend_from_slice(template);
-        out
-    }
-}
-
-const RELEASE_RECORD: [u8; 4] = *b"BZR1";
-
-/// A stored optimized compile. [`StoredRelease::Previous`] is a template blob from before
-/// traces were recorded (`BZT7`). It is reused only through [`release_template_key`], which
-/// covers the reads. [`StoredRelease::Recorded`] is reused when its trace matches.
-pub enum StoredRelease<'a> {
-    Previous(&'a [u8]),
-    Recorded { trace: ReleaseTrace, key: Key, template: &'a [u8] },
-}
-
-impl StoredRelease<'_> {
-    /// Whether this record was made from `now`'s reads. A previous-layout template has no
-    /// recorded reads, so it is not reused through the lookup key.
-    pub fn reuses(&self, now: &ReleaseTrace) -> bool {
-        match self {
-            StoredRelease::Previous(_) => false,
-            StoredRelease::Recorded { trace, .. } => trace.reuses(now),
-        }
-    }
-
-    /// Whether this record is the compile `now` would make under `key`. A previous-layout
-    /// template has no recorded reads, so the lookup refuses it. The same bodies under
-    /// another release key (other references) are another compile.
-    pub fn accepts(&self, now: &ReleaseTrace, key: &Key) -> bool {
-        match self {
-            StoredRelease::Previous(_) => false,
-            StoredRelease::Recorded { trace, key: stored, .. } => trace.reuses(now) && stored == key,
-        }
-    }
-
-    /// The template blob.
-    pub fn template(&self) -> &[u8] {
-        match self {
-            StoredRelease::Previous(bytes) => bytes,
-            StoredRelease::Recorded { template, .. } => template,
-        }
-    }
-}
-
-/// `bytes` as a release record. A template of the previous layout (`BZT7`) is
-/// [`StoredRelease::Previous`]. Anything else that is not `BZR1`, a read list that does not
-/// fit, or a template section that is not itself a template, is refused by name.
-pub fn open_release(bytes: &[u8]) -> Result<StoredRelease<'_>, String> {
-    if bytes.starts_with(b"BZT7") {
-        return Ok(StoredRelease::Previous(bytes));
-    }
-    if !bytes.starts_with(&RELEASE_RECORD) {
-        return Err(
-            "a release record whose first bytes are not BZR1 or a template of the previous layout (BZT7)"
-                .to_string(),
-        );
-    }
-    let rest = &bytes[4..];
-    if rest.len() < 8 {
-        return Err("a release record whose read list length does not fit".to_string());
-    }
-    let Ok(len_bytes) = rest[..8].try_into() else {
-        return Err("a release record whose read list length does not fit".to_string());
-    };
-    let len = u64::from_le_bytes(len_bytes) as usize;
-    let body = &rest[8..];
-    let reads_bytes = len.checked_mul(32).ok_or_else(|| {
-        "a release record whose read list does not fit".to_string()
-    })?;
-    if body.len() < reads_bytes {
-        return Err("a release record whose read list does not fit".to_string());
-    }
-    let mut reads = Vec::with_capacity(len); // alloc: the trace, one per record opened
-    for chunk in body[..reads_bytes].chunks_exact(32) {
-        let mut id = [0; 32];
-        id.copy_from_slice(chunk);
-        reads.push(InstanceKey(ContentId(id)));
-    }
-    if body.len() < reads_bytes + 32 {
-        return Err("a release record whose key does not fit".to_string());
-    }
-    let mut key_bytes = [0; 32];
-    key_bytes.copy_from_slice(&body[reads_bytes..reads_bytes + 32]);
-    let template = &body[reads_bytes + 32..];
-    if !template.starts_with(b"BZT7") {
-        return Err(
-            "a release record whose template is not a template of the previous layout (BZT7)"
-                .to_string(),
-        );
-    }
-    Ok(StoredRelease::Recorded {
-        trace: ReleaseTrace { reads },
-        key: Key(ContentId(key_bytes)),
-        template,
-    })
 }
 
 pub const IMPORTED_DOMAIN: &str = "blaze v2 release imported bodies 2";
@@ -4763,55 +4653,24 @@ impl<'a, B: Prepare> Build<'a, B> {
                 &imported_built_in,
             );
             let key = job.unit.instance.key();
-            let trace = ReleaseTrace::of(&job.node.built_in, &imported_units, &imported_built_in);
-            let lookup = keys::release_lookup(
-                &Instance { code: job.node.described.template_code, ..job.unit.instance }.key().0,
-                &job.spec.toolchain.id,
-            );
-            let from_lookup = out.read(store, &lookup, &job.unit, |it| {
-                let opened = open_release(it)?;
-                if !opened.accepts(&trace, &blob_key) {
-                    return Ok(None);
-                }
-                stored_function(opened.template(), key, &refs, job.node.described.anchors.as_ref())
-                    .map(Some)
-            });
-            match from_lookup {
-                Read::Hit(Some(made)) => {
+            match out.read(store, &blob_key, &job.unit, |it| {
+                stored_function(it, key, &refs, job.node.described.anchors.as_ref())
+            }) {
+                Read::Hit(made) => {
                     out.stats.stored += 1;
                     out.made(
                         &job.unit,
                         &job.node.described.name,
                         key,
-                        Whence::Store(lookup),
+                        Whence::Store(blob_key),
                         made,
                     );
                     if self.verify.sampled(&blob_key.0) {
                         sampled.push((job.name, imports, refs, blob_key));
                     }
                 }
+                Read::Miss => missing.push((job.name, imports, refs, blob_key)),
                 Read::Failed => {}
-                Read::Hit(None) | Read::Miss => {
-                    match out.read(store, &blob_key, &job.unit, |it| {
-                        stored_function(it, key, &refs, job.node.described.anchors.as_ref())
-                    }) {
-                        Read::Hit(made) => {
-                            out.stats.stored += 1;
-                            out.made(
-                                &job.unit,
-                                &job.node.described.name,
-                                key,
-                                Whence::Store(blob_key),
-                                made,
-                            );
-                            if self.verify.sampled(&blob_key.0) {
-                                sampled.push((job.name, imports, refs, blob_key));
-                            }
-                        }
-                        Read::Miss => missing.push((job.name, imports, refs, blob_key)),
-                        Read::Failed => {}
-                    }
-                }
             }
         }
         // Each compile the store missed is one build's of the memo ([`crate::flight`]), by its
@@ -4912,27 +4771,6 @@ impl<'a, B: Prepare> Build<'a, B> {
             else {
                 return (None, out);
             };
-            let imported_units: Vec<InstanceKey> = imports
-                .imported
-                .iter()
-                .map(|it| by_name[it].unit.instance.key())
-                .collect(); // alloc: per release compile, sized by its imports
-            let imported_built_in: Vec<&[InstanceKey]> = imports
-                .imported
-                .iter()
-                .map(|it| by_name[it].node.built_in.as_slice())
-                .collect(); // alloc: per release compile, sized by its imports
-            let trace = ReleaseTrace::of(&job.node.built_in, &imported_units, &imported_built_in);
-            let lookup = keys::release_lookup(
-                &Instance { code: job.node.described.template_code, ..job.unit.instance }.key().0,
-                &job.spec.toolchain.id,
-            );
-            out.put(
-                By::node(job.name, &job.unit),
-                lookup,
-                Kind::Code,
-                trace.record(&blob_key, &blob::encode(kept)),
-            );
             out.instantiate(
                 &job.unit,
                 &job.node.described.name,
