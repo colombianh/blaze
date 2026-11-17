@@ -413,6 +413,11 @@ pub fn sweep_parts(sources: &std::path::Path) -> Result<Vec<std::path::PathBuf>,
 /// package is never edited in place (its [`ON_DISK_MARK`] would no longer hold).
 fn write_tree(dir: &std::path::Path, files: &[SourceFile]) -> Result<(), String> {
     std::fs::create_dir(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    // Make files read-only only after every one is written. Some crates hold two entries whose
+    // names differ only by case (`README.md` and `readme.md` in windows-core 0.62.1); on a
+    // case-insensitive volume they are one path, so making the first read-only as it is written
+    // refuses the second with EACCES. The last entry written wins, as on a case-sensitive disk.
+    let mut made: Vec<(std::path::PathBuf, Mode)> = Vec::new(); // alloc: one per file of a package
     for file in files {
         let path = dir.join(&file.path);
         if let Some(parent) = path.parent() {
@@ -434,20 +439,23 @@ fn write_tree(dir: &std::path::Path, files: &[SourceFile]) -> Result<(), String>
             Mode::Regular | Mode::Executable => {
                 std::fs::write(&path, &file.bytes)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
-                let mut permissions = std::fs::metadata(&path)
-                    .map_err(|e| format!("{}: {e}", path.display()))?
-                    .permissions();
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    permissions.set_mode(if file.mode == Mode::Executable { 0o555 } else { 0o444 });
-                }
-                #[cfg(not(unix))]
-                permissions.set_readonly(true);
-                std::fs::set_permissions(&path, permissions)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                made.push((path.clone(), file.mode));
             }
         }
+    }
+    for (path, mode) in made {
+        let mut permissions = std::fs::metadata(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(if mode == Mode::Executable { 0o555 } else { 0o444 });
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(())
 }

@@ -386,6 +386,24 @@ fn a_path_twice_is_refused() {
     assert!(error.what.contains("\"serde-1.0.219/src/lib.rs\""), "{}", error.what);
 }
 
+/// windows-core 0.62.1 holds both `README.md` and `readme.md`. On a case-insensitive volume they
+/// are one path, so making the first read-only as it is written refuses the second with EACCES.
+/// Permissions are set after every file is written: both entries unpack and the last one wins.
+#[test]
+fn names_that_differ_only_by_case_unpack() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("part");
+    super::write_tree(
+        &dir,
+        &[
+            file("README.md", b"first\n", Mode::Regular),
+            file("readme.md", b"second\n", Mode::Regular),
+        ],
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(dir.join("readme.md")).unwrap(), b"second\n");
+}
+
 fn index_fetch() -> Fetch {
     Fetch {
         what: "serde's entry in the crates.io index".to_owned(),
